@@ -825,6 +825,10 @@ class MarketMaker:
             if base_sell_price > ask_price * 1.005:
                 base_sell_price = ask_price * 1.005
             
+            # 根据tick_size四舍五入价格
+            base_buy_price = round_to_tick_size(base_buy_price, self.tick_size)
+            base_sell_price = round_to_tick_size(base_sell_price, self.tick_size)
+            
             # 记录价格信息
             logger.info(f"市场中间价: {mid_price}")
             logger.info(f"买入价: {base_buy_price} (距离最佳买价: {((bid_price - base_buy_price) / bid_price * 100):.4f}%)")
