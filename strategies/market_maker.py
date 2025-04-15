@@ -1034,7 +1034,7 @@ class MarketMaker:
             return True
     
     def place_limit_orders(self):
-        """下限價單"""
+        """下限价单"""
         self.check_ws_connection()
         self.cancel_existing_orders()
         
@@ -1086,11 +1086,33 @@ class MarketMaker:
             quote_amount_per_side = quote_balance * allocation_percent
             base_amount_per_side = base_balance * allocation_percent
             
-            buy_quantity = max(self.min_order_size, round_to_precision(quote_amount_per_side / avg_price, self.base_precision))
-            sell_quantity = max(self.min_order_size, round_to_precision(base_amount_per_side, self.base_precision))
+            # 确保买入数量精度正确
+            buy_quantity = quote_amount_per_side / avg_price
+            buy_quantity = round_to_precision(buy_quantity, self.base_precision)
+            buy_quantity = max(self.min_order_size, buy_quantity)
+            
+            # 确保卖出数量精度正确
+            sell_quantity = round_to_precision(base_amount_per_side, self.base_precision)
+            sell_quantity = max(self.min_order_size, sell_quantity)
+            
+            # 额外检查确保不超过精度限制
+            buy_quantity_str = str(buy_quantity)
+            sell_quantity_str = str(sell_quantity)
+            
+            if '.' in buy_quantity_str and len(buy_quantity_str.split('.')[-1]) > self.base_precision:
+                buy_quantity = float(f"%.{self.base_precision}f" % buy_quantity)
+            
+            if '.' in sell_quantity_str and len(sell_quantity_str.split('.')[-1]) > self.base_precision:
+                sell_quantity = float(f"%.{self.base_precision}f" % sell_quantity)
+                
+            logger.info(f"计算得出订单数量 - 买入: {buy_quantity}, 卖出: {sell_quantity}")
         else:
-            buy_quantity = max(self.min_order_size, round_to_precision(self.order_quantity, self.base_precision))
-            sell_quantity = max(self.min_order_size, round_to_precision(self.order_quantity, self.base_precision))
+            buy_quantity = round_to_precision(self.order_quantity, self.base_precision)
+            sell_quantity = round_to_precision(self.order_quantity, self.base_precision)
+            
+            # 确保不超过精度限制
+            buy_quantity = float(f"%.{self.base_precision}f" % buy_quantity)
+            sell_quantity = float(f"%.{self.base_precision}f" % sell_quantity)
         
         # 下買單
         buy_order_count = 0
@@ -1205,15 +1227,33 @@ class MarketMaker:
             # 综合调整因子
             adjustment_factor = (volume_factor + depth_factor) / 2
             
+            # 调整数量并确保精度正确
             adjusted_quantity = base_quantity * adjustment_factor
             
             # 确保在最小订单大小和最大限制之间
-            return max(self.min_order_size, 
-                      min(adjusted_quantity, base_quantity * 2))
+            final_quantity = max(
+                self.min_order_size, 
+                min(adjusted_quantity, base_quantity * 2)
+            )
+            
+            # 根据基础资产精度进行四舍五入
+            final_quantity = round_to_precision(final_quantity, self.base_precision)
+            
+            # 额外检查确保不超过精度限制
+            quantity_str = str(final_quantity)
+            decimal_places = len(quantity_str.split('.')[-1]) if '.' in quantity_str else 0
+            
+            if decimal_places > self.base_precision:
+                # 如果精度超出限制，则截断到允许的精度
+                final_quantity = float(f"%.{self.base_precision}f" % final_quantity)
+            
+            logger.info(f"调整后订单数量: {final_quantity} (原始: {base_quantity}, 精度: {self.base_precision})")
+            return final_quantity
                       
         except Exception as e:
             logger.error(f"调整订单数量时出错: {e}")
-            return base_quantity
+            # 发生错误时返回安全的数量
+            return round_to_precision(base_quantity, self.base_precision)
     
     def cancel_existing_orders(self):
         """取消所有現有訂單"""
