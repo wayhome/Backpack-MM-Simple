@@ -1075,19 +1075,63 @@ class MarketMaker:
                 logger.warning("賬戶余額為0，無法下單")
                 return
                 
-            # 计算买单数量
-            buy_quantity = min(
-                self.order_quantity,
-                quote_balance / buy_price if buy_price > 0 else 0
-            )
-            buy_quantity = round_to_precision(buy_quantity, self.base_precision)
-            
-            # 计算卖单数量
-            sell_quantity = min(
-                self.order_quantity,
-                base_balance
-            )
-            sell_quantity = round_to_precision(sell_quantity, self.base_precision)
+            # 如果order_quantity为None，根据余额计算合适的订单数量
+            if self.order_quantity is None:
+                # 使用当前买入价格计算数量
+                avg_price = buy_price  # 修改这里，直接使用买入价格
+                
+                # 提高资金利用率，根据市场深度动态调整
+                order_book = get_order_book(self.symbol)
+                if isinstance(order_book, dict) and "error" in order_book:
+                    allocation_percent = 0.05  # 默认值
+                else:
+                    # 分析市场深度
+                    total_bid_depth = sum(float(bid[1]) for bid in order_book['bids'][:5])
+                    total_ask_depth = sum(float(ask[1]) for ask in order_book['asks'][:5])
+                    avg_market_depth = (total_bid_depth + total_ask_depth) / 2
+                    
+                    # 根据市场深度动态调整资金使用比例
+                    base_allocation = 0.08  # 基础分配比例
+                    depth_factor = min(1.5, max(0.8, avg_market_depth / (base_balance if base_balance > 0 else 1)))
+                    allocation_percent = base_allocation * depth_factor
+                    
+                    # 确保总资金使用不超过50%
+                    total_allocation = allocation_percent * self.max_orders
+                    if total_allocation > 0.5:
+                        allocation_percent = 0.5 / self.max_orders
+                
+                # 计算买入和卖出订单的最大可用数量
+                max_buy_quantity = quote_balance / avg_price / self.max_orders
+                max_sell_quantity = base_balance / self.max_orders
+                
+                # 确保买入数量不超过可用资金
+                buy_quantity = min(
+                    max_buy_quantity,
+                    quote_balance * allocation_percent / avg_price
+                )
+                buy_quantity = round_to_precision(buy_quantity, self.base_precision)
+                
+                # 确保卖出数量不超过可用余额
+                sell_quantity = min(
+                    max_sell_quantity,
+                    base_balance * allocation_percent
+                )
+                sell_quantity = round_to_precision(sell_quantity, self.base_precision)
+            else:
+                # 使用固定的order_quantity
+                # 计算买单数量
+                buy_quantity = min(
+                    self.order_quantity,
+                    quote_balance / buy_price if buy_price > 0 else 0
+                )
+                buy_quantity = round_to_precision(buy_quantity, self.base_precision)
+                
+                # 计算卖单数量
+                sell_quantity = min(
+                    self.order_quantity,
+                    base_balance
+                )
+                sell_quantity = round_to_precision(sell_quantity, self.base_precision)
             
             # 检查下单数量是否满足最小要求
             if buy_quantity < self.min_order_size:
