@@ -1153,28 +1153,48 @@ class MarketMaker:
             # 下买单
             if buy_quantity > 0:
                 try:
-                    order = self.place_order(
-                        symbol=self.symbol,
-                        side="BUY",
-                        order_type="LIMIT",
-                        quantity=buy_quantity,
-                        price=buy_price
-                    )
-                    logger.info(f"買單已提交: {order}")
+                    # 构建买单
+                    buy_order = {
+                        "orderType": "Limit",
+                        "price": str(buy_price),
+                        "quantity": str(buy_quantity),
+                        "side": "Bid",
+                        "symbol": self.symbol,
+                        "timeInForce": "GTC",
+                        "postOnly": True
+                    }
+                    
+                    # 执行买单
+                    result = execute_order(self.api_key, self.secret_key, buy_order)
+                    if isinstance(result, dict) and "error" in result:
+                        logger.error(f"買單執行失敗: {result['error']}")
+                    else:
+                        logger.info(f"買單已提交: {result}")
+                        self.orders_placed += 1
                 except Exception as e:
                     logger.error(f"買單提交失敗: {str(e)}")
                     
             # 下卖单
             if sell_quantity > 0:
                 try:
-                    order = self.place_order(
-                        symbol=self.symbol,
-                        side="SELL",
-                        order_type="LIMIT",
-                        quantity=sell_quantity,
-                        price=sell_price
-                    )
-                    logger.info(f"賣單已提交: {order}")
+                    # 构建卖单
+                    sell_order = {
+                        "orderType": "Limit",
+                        "price": str(sell_price),
+                        "quantity": str(sell_quantity),
+                        "side": "Ask",
+                        "symbol": self.symbol,
+                        "timeInForce": "GTC",
+                        "postOnly": True
+                    }
+                    
+                    # 执行卖单
+                    result = execute_order(self.api_key, self.secret_key, sell_order)
+                    if isinstance(result, dict) and "error" in result:
+                        logger.error(f"賣單執行失敗: {result['error']}")
+                    else:
+                        logger.info(f"賣單已提交: {result}")
+                        self.orders_placed += 1
                 except Exception as e:
                     logger.error(f"賣單提交失敗: {str(e)}")
                     
