@@ -32,6 +32,7 @@ class MarketMaker:
         min_profit_multiplier=1.5,     # 最小利润倍数
         max_position_size=50.0,        # 最大持仓规模(占总资产百分比)
         aggressive_factor=1.2,         # 市场深度良好时的进取因子
+        max_spread=0.5,               # 最大允许价差（百分比）
         ws_proxy=None
     ):
         self.api_key = api_key
@@ -45,6 +46,8 @@ class MarketMaker:
         self.min_profit_multiplier = min_profit_multiplier
         self.max_position_size = max_position_size
         self.aggressive_factor = aggressive_factor
+        self.max_spread = max_spread
+        self.ws_proxy = ws_proxy
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -1644,19 +1647,28 @@ class MarketMaker:
                 logger.error(f"获取K线数据失败: {klines['error']}")
                 return 0.0
                 
-            if not klines:
+            if not klines or not isinstance(klines, list):
+                logger.warning("K线数据无效或为空")
                 return 0.0
                 
             # 计算收盘价的标准差
-            closes = [float(k[4]) for k in klines]  # k[4]是收盘价
-            std_dev = np.std(closes)
-            mean_price = np.mean(closes)
-            
-            # 返回波动率（标准差/均价）
-            volatility = std_dev / mean_price if mean_price > 0 else 0.0
-            logger.info(f"当前波动率: {volatility:.4f}")
-            return volatility
-            
+            try:
+                closes = [float(k[4]) for k in klines]  # k[4]是收盘价
+                if not closes:
+                    logger.warning("无有效收盘价数据")
+                    return 0.0
+                    
+                std_dev = np.std(closes)
+                mean_price = np.mean(closes)
+                
+                # 返回波动率（标准差/均价）
+                volatility = (std_dev / mean_price) if mean_price > 0 else 0.0
+                logger.info(f"当前波动率: {volatility:.4f}")
+                return volatility
+            except (IndexError, ValueError) as e:
+                logger.error(f"处理K线数据时出错: {str(e)}")
+                return 0.0
+                
         except Exception as e:
             logger.error(f"计算波动率出错: {str(e)}")
             return 0.0
@@ -1670,21 +1682,30 @@ class MarketMaker:
                 logger.error(f"获取K线数据失败: {klines['error']}")
                 return 0.0
                 
-            if not klines:
+            if not klines or not isinstance(klines, list):
+                logger.warning("K线数据无效或为空")
                 return 0.0
                 
-            # 计算简单移动平均线
-            closes = [float(k[4]) for k in klines]  # k[4]是收盘价
-            sma_5 = np.mean(closes[-5:])
-            sma_12 = np.mean(closes)
-            
-            # 计算趋势强度 (-1到1之间)
-            trend = (sma_5 - sma_12) / sma_12 if sma_12 > 0 else 0.0
-            trend = max(min(trend, 1.0), -1.0)
-            
-            logger.info(f"当前趋势: {trend:.4f}")
-            return trend
-            
+            try:
+                # 计算简单移动平均线
+                closes = [float(k[4]) for k in klines]  # k[4]是收盘价
+                if len(closes) < 12:
+                    logger.warning("K线数据不足")
+                    return 0.0
+                    
+                sma_5 = np.mean(closes[-5:])
+                sma_12 = np.mean(closes)
+                
+                # 计算趋势强度 (-1到1之间)
+                trend = (sma_5 - sma_12) / sma_12 if sma_12 > 0 else 0.0
+                trend = max(min(trend, 1.0), -1.0)
+                
+                logger.info(f"当前趋势: {trend:.4f}")
+                return trend
+            except (IndexError, ValueError) as e:
+                logger.error(f"处理K线数据时出错: {str(e)}")
+                return 0.0
+                
         except Exception as e:
             logger.error(f"计算趋势出错: {str(e)}")
             return 0.0
@@ -1727,14 +1748,28 @@ class MarketMaker:
                 logger.error(f"获取K线数据失败: {klines['error']}")
                 return 0.0
                 
-            # 计算平均成交量
-            volumes = [float(k[5]) for k in klines]
-            avg_volume = np.mean(volumes)
-            max_volume = max(volumes)
-            
-            # 返回成交量水平 (0到1之间)
-            return avg_volume / max_volume if max_volume > 0 else 0.0
-            
+            if not klines or not isinstance(klines, list):
+                logger.warning("K线数据无效或为空")
+                return 0.0
+                
+            try:
+                # 计算平均成交量
+                volumes = [float(k[5]) for k in klines]  # k[5]是成交量
+                if not volumes:
+                    logger.warning("无有效成交量数据")
+                    return 0.0
+                    
+                avg_volume = np.mean(volumes)
+                max_volume = max(volumes)
+                
+                # 返回成交量水平 (0到1之间)
+                volume_level = avg_volume / max_volume if max_volume > 0 else 0.0
+                logger.info(f"当前成交量水平: {volume_level:.4f}")
+                return volume_level
+            except (IndexError, ValueError) as e:
+                logger.error(f"处理成交量数据时出错: {str(e)}")
+                return 0.0
+                
         except Exception as e:
             logger.error(f"计算成交量水平出错: {str(e)}")
             return 0.0
@@ -1743,24 +1778,33 @@ class MarketMaker:
         """计算当前点差水平"""
         try:
             if not self.ws.orderbook:
+                logger.warning("订单簿数据不可用")
                 return 0.0
                 
-            bids = self.ws.orderbook['bids']
-            asks = self.ws.orderbook['asks']
+            bids = self.ws.orderbook.get('bids', [])
+            asks = self.ws.orderbook.get('asks', [])
             
             if not bids or not asks:
+                logger.warning("买卖盘数据不完整")
                 return 0.0
                 
-            # 计算当前点差
-            best_bid = float(bids[0][0])
-            best_ask = float(asks[0][0])
-            
-            # 计算点差比率
-            spread = (best_ask - best_bid) / best_bid if best_bid > 0 else 0.0
-            
-            # 返回标准化的点差水平 (0到1之间)
-            return min(spread / self.max_spread, 1.0)
-            
+            try:
+                # 计算当前点差
+                best_bid = float(bids[0][0])
+                best_ask = float(asks[0][0])
+                
+                # 计算点差比率
+                spread = (best_ask - best_bid) / best_bid if best_bid > 0 else 0.0
+                
+                # 返回标准化的点差水平 (0到1之间)
+                spread_level = min(spread / (self.max_spread / 100), 1.0)
+                logger.info(f"当前点差水平: {spread_level:.4f}")
+                return spread_level
+                
+            except (IndexError, ValueError, ZeroDivisionError) as e:
+                logger.error(f"处理订单簿数据时出错: {str(e)}")
+                return 0.0
+                
         except Exception as e:
             logger.error(f"计算点差水平出错: {str(e)}")
             return 0.0
@@ -1768,6 +1812,10 @@ class MarketMaker:
     def _adjust_parameters(self):
         """根据市场状态调整参数"""
         try:
+            if not all(key in self.market_state for key in ['depth_score', 'volume_level', 'volatility', 'spread_level']):
+                logger.warning("市场状态数据不完整")
+                return
+                
             # 计算市场得分
             market_score = (
                 self.market_state['depth_score'] * 0.3 +
@@ -1776,28 +1824,31 @@ class MarketMaker:
                 (1 - self.market_state['spread_level']) * 0.2
             )
             
+            # 确保得分在0-1之间
+            market_score = max(0.0, min(1.0, market_score))
+            
             # 根据市场得分调整参数
             self.base_spread_percentage = self._interpolate(
-                self.param_ranges['base_spread'][0],
-                self.param_ranges['base_spread'][1],
+                self.param_ranges['base_spread']['min'],
+                self.param_ranges['base_spread']['max'],
                 market_score
             )
             
             self.max_orders = int(self._interpolate(
-                self.param_ranges['orders'][0],
-                self.param_ranges['orders'][1],
+                self.param_ranges['orders']['min'],
+                self.param_ranges['orders']['max'],
                 market_score
             ))
             
             self.min_profit_multiplier = self._interpolate(
-                self.param_ranges['profit_multiplier'][0],
-                self.param_ranges['profit_multiplier'][1],
+                self.param_ranges['profit_multiplier']['min'],
+                self.param_ranges['profit_multiplier']['max'],
                 market_score
             )
             
             self.max_position_size = self._interpolate(
-                self.param_ranges['position_size'][0],
-                self.param_ranges['position_size'][1],
+                self.param_ranges['position_size']['min'],
+                self.param_ranges['position_size']['max'],
                 market_score
             )
             
@@ -1809,8 +1860,8 @@ class MarketMaker:
             if abs(self.market_state['trend']) > 0.8:  # 明显趋势
                 trend_direction = 1 if self.market_state['trend'] > 0 else -1
                 self.aggressive_factor = self._interpolate(
-                    self.param_ranges['aggressive'][0],
-                    self.param_ranges['aggressive'][1],
+                    self.param_ranges['aggressive']['min'],
+                    self.param_ranges['aggressive']['max'],
                     0.7 + 0.3 * trend_direction
                 )
             
