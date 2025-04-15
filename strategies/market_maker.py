@@ -2,14 +2,13 @@
 做市策略模塊
 """
 import time
-import threading
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional, Union, Any
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+import numpy as np
 
 from api.client import (
     get_balance, execute_order, get_open_orders, cancel_all_orders, 
-    cancel_order, get_market_limits, get_klines, get_ticker, get_order_book
+    cancel_order, get_market_limits, get_ticker, get_order_book, get_klines
 )
 from ws_client.client import BackpackWebSocket
 from database.db import Database
@@ -25,10 +24,14 @@ class MarketMaker:
         secret_key, 
         symbol, 
         db_instance=None,
-        base_spread_percentage=0.2, 
+        base_spread_percentage=0.24,  # 提高基础价差到0.24%以确保盈利
         order_quantity=None, 
-        max_orders=3, 
-        rebalance_threshold=15.0,
+        max_orders=5,
+        rebalance_threshold=10.0,
+        volatility_threshold=0.02,     # 波动率阈值
+        min_profit_multiplier=1.5,     # 最小利润倍数
+        max_position_size=50.0,        # 最大持仓规模(占总资产百分比)
+        aggressive_factor=1.2,         # 市场深度良好时的进取因子
         ws_proxy=None
     ):
         self.api_key = api_key
@@ -38,6 +41,10 @@ class MarketMaker:
         self.order_quantity = order_quantity
         self.max_orders = max_orders
         self.rebalance_threshold = rebalance_threshold
+        self.volatility_threshold = volatility_threshold
+        self.min_profit_multiplier = min_profit_multiplier
+        self.max_position_size = max_position_size
+        self.aggressive_factor = aggressive_factor
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -70,6 +77,28 @@ class MarketMaker:
         self.taker_buy_volume = 0
         self.taker_sell_volume = 0
         self.total_fees = 0
+
+        # 市场分析相关属性
+        self.market_state = {
+            'volatility': 0,           # 当前波动率
+            'trend': 0,                # 市场趋势（1=上升，-1=下降，0=横盘）
+            'depth_score': 0,          # 市场深度评分（0-1）
+            'volume_level': 0,         # 成交量水平（0-1）
+            'spread_level': 0,         # 市场价差水平（0-1）
+        }
+        
+        # 参数调整范围
+        self.param_ranges = {
+            'base_spread': {'min': 0.24, 'max': 0.5},
+            'orders': {'min': 3, 'max': 8},
+            'profit_multiplier': {'min': 1.3, 'max': 2.0},
+            'position_size': {'min': 30.0, 'max': 70.0},
+            'aggressive': {'min': 1.1, 'max': 1.4}
+        }
+        
+        # 市场分析定时器
+        self.last_analysis_time = time.time()
+        self.analysis_interval = 300  # 5分钟分析一次
 
         # 添加代理参数
         self.ws_proxy = ws_proxy
@@ -136,7 +165,7 @@ class MarketMaker:
             # 訂閲私有訂單更新流
             self.subscribe_order_updates()
         else:
-            logger.warning(f"WebSocket連接建立超時，將在運行過程中繼續嘗試連接")
+            logger.warning("WebSocket連接建立超時，將在運行過程中繼續嘗試連接")
     
     def _load_trading_stats(self):
         """從數據庫加載交易統計數據"""
@@ -155,7 +184,7 @@ class MarketMaker:
                 self.total_profit = stat['realized_profit']
                 self.total_fees = stat['total_fees']
                 
-                logger.info(f"已從數據庫加載今日交易統計")
+                logger.info("已從數據庫加載今日交易統計")
                 logger.info(f"Maker買入量: {self.maker_buy_volume}, Maker賣出量: {self.maker_sell_volume}")
                 logger.info(f"Taker買入量: {self.taker_buy_volume}, Taker賣出量: {self.taker_sell_volume}")
                 logger.info(f"已實現利潤: {self.total_profit}, 總手續費: {self.total_fees}")
@@ -297,7 +326,7 @@ class MarketMaker:
                     if hasattr(self.ws, 'ws') and self.ws.ws:
                         try:
                             self.ws.ws.close()
-                        except:
+                        except Exception:
                             pass
                     self.ws.close()
                     time.sleep(0.5)
@@ -703,10 +732,39 @@ class MarketMaker:
     
     def calculate_dynamic_spread(self):
         """計算動態價差基於市場情況"""
-        base_spread = self.base_spread_percentage
+        # 手续费率
+        MAKER_FEE = 0.0008  # 0.08%
+        TAKER_FEE = 0.0010  # 0.10%
         
-        # 返回基礎價差，不再進行動態計算
-        return base_spread
+        # 计算最小价差以覆盖手续费
+        min_spread_for_fees = (MAKER_FEE + MAKER_FEE) * 100  # 转换为百分比
+        # 使用配置的最小利润倍数
+        min_profitable_spread = min_spread_for_fees * self.min_profit_multiplier
+        
+        # 基础价差不应小于最小盈利价差
+        base_spread = max(self.base_spread_percentage, min_profitable_spread)
+        
+        # 获取当前市场波动率
+        volatility = 0
+        if self.ws and hasattr(self.ws, 'historical_prices'):
+            volatility = calculate_volatility(self.ws.historical_prices)
+        
+        # 根据波动率调整价差
+        if volatility > 0:
+            if volatility > self.volatility_threshold:  # 高波动
+                # 高波动时显著增加价差
+                adjusted_spread = base_spread * (1 + volatility * 2)
+            else:  # 低波动
+                # 低波动时适当减小价差，但不低于最小盈利价差
+                adjusted_spread = max(
+                    min_profitable_spread,
+                    base_spread * (1 - volatility * 0.5)
+                )
+        else:
+            adjusted_spread = base_spread
+            
+        logger.info(f"最小盈利价差: {min_profitable_spread:.4f}%, 调整后价差: {adjusted_spread:.4f}%")
+        return adjusted_spread
     
     def calculate_prices(self):
         """計算買賣訂單價格"""
@@ -723,12 +781,16 @@ class MarketMaker:
             
             logger.info(f"市場中間價: {mid_price}")
             
-            # 使用基礎價差
-            spread_percentage = self.base_spread_percentage
+            # 使用考虑手续费的动态价差
+            spread_percentage = self.calculate_dynamic_spread()
             exact_spread = mid_price * (spread_percentage / 100)
             
-            base_buy_price = mid_price - (exact_spread / 2)
-            base_sell_price = mid_price + (exact_spread / 2)
+            # 计算买卖价格时额外考虑手续费影响
+            MAKER_FEE = 0.0008
+            fee_adjustment = mid_price * MAKER_FEE
+            
+            base_buy_price = mid_price - (exact_spread / 2) - fee_adjustment
+            base_sell_price = mid_price + (exact_spread / 2) + fee_adjustment
             
             base_buy_price = round_to_tick_size(base_buy_price, self.tick_size)
             base_sell_price = round_to_tick_size(base_sell_price, self.tick_size)
@@ -879,7 +941,7 @@ class MarketMaker:
                         if 'id' in result:
                             self.db.record_rebalance_order(result['id'], self.symbol)
             else:
-                logger.info(f"重新平衡賣單已提交，作為maker")
+                logger.info("重新平衡賣單已提交，作為maker")
                 # 記錄這是一個重平衡訂單
                 if 'id' in result:
                     self.db.record_rebalance_order(result['id'], self.symbol)
@@ -929,7 +991,7 @@ class MarketMaker:
                         if 'id' in result:
                             self.db.record_rebalance_order(result['id'], self.symbol)
             else:
-                logger.info(f"重平衡買單已提交，作為maker")
+                logger.info("重平衡買單已提交，作為maker")
                 # 記錄這是一個重平衡訂單
                 if 'id' in result:
                     self.db.record_rebalance_order(result['id'], self.symbol)
@@ -1001,9 +1063,26 @@ class MarketMaker:
             # 計算每個訂單的數量
             avg_price = sum(buy_prices) / len(buy_prices)
             
-            # 使用更保守的分配比例，避免資金用盡
-            allocation_percent = min(0.05, 1.0 / (self.max_orders * 4))  # 最多使用總資金的25%
-            
+            # 提高资金利用率，根据市场深度动态调整
+            order_book = get_order_book(self.symbol)
+            if isinstance(order_book, dict) and "error" in order_book:
+                allocation_percent = 0.05  # 默认值
+            else:
+                # 分析市场深度
+                total_bid_depth = sum(float(bid[1]) for bid in order_book['bids'][:5])
+                total_ask_depth = sum(float(ask[1]) for ask in order_book['asks'][:5])
+                avg_market_depth = (total_bid_depth + total_ask_depth) / 2
+                
+                # 根据市场深度动态调整资金使用比例
+                base_allocation = 0.08  # 基础分配比例提高到8%
+                depth_factor = min(1.5, max(0.8, avg_market_depth / (base_balance if base_balance > 0 else 1)))
+                allocation_percent = base_allocation * depth_factor
+                
+                # 确保总资金使用不超过50%
+                total_allocation = allocation_percent * self.max_orders
+                if total_allocation > 0.5:
+                    allocation_percent = 0.5 / self.max_orders
+
             quote_amount_per_side = quote_balance * allocation_percent
             base_amount_per_side = base_balance * allocation_percent
             
@@ -1100,9 +1179,41 @@ class MarketMaker:
         logger.info(f"共下單: {buy_order_count} 個買單, {sell_order_count} 個賣單")
     
     def _adjust_quantity_by_market(self, base_quantity, side):
-        """根據市場情況動態調整訂單數量"""
-        # 直接返回基本數量，不進行任何調整
-        return max(self.min_order_size, round_to_precision(base_quantity, self.base_precision))
+        """根据市场情况动态调整订单数量"""
+        try:
+            # 获取24小时成交量
+            ticker = get_ticker(self.symbol)
+            volume_24h = float(ticker.get('volume', 0))
+            
+            # 计算平均每小时成交量
+            avg_hourly_volume = volume_24h / 24
+            
+            # 根据成交量调整订单大小
+            volume_factor = min(1.5, max(0.5, avg_hourly_volume / base_quantity))
+            
+            # 获取订单簿深度
+            order_book = get_order_book(self.symbol)
+            depth_factor = 1.0
+            
+            if side == 'buy':
+                total_ask_volume = sum(float(ask[1]) for ask in order_book['asks'][:5])
+                depth_factor = min(1.5, max(0.5, total_ask_volume / base_quantity))
+            else:
+                total_bid_volume = sum(float(bid[1]) for bid in order_book['bids'][:5])
+                depth_factor = min(1.5, max(0.5, total_bid_volume / base_quantity))
+            
+            # 综合调整因子
+            adjustment_factor = (volume_factor + depth_factor) / 2
+            
+            adjusted_quantity = base_quantity * adjustment_factor
+            
+            # 确保在最小订单大小和最大限制之间
+            return max(self.min_order_size, 
+                      min(adjusted_quantity, base_quantity * 2))
+                      
+        except Exception as e:
+            logger.error(f"调整订单数量时出错: {e}")
+            return base_quantity
     
     def cancel_existing_orders(self):
         """取消所有現有訂單"""
@@ -1282,7 +1393,7 @@ class MarketMaker:
             logger.info(f"未實現利潤: {unrealized_pnl:.8f} {self.quote_asset}")
             
             # 打印本次執行的統計信息
-            logger.info(f"\n---本次執行統計---")
+            logger.info("\n---本次執行統計---")
             logger.info(f"本次執行已實現利潤: {session_realized_pnl:.8f} {self.quote_asset}")
             logger.info(f"本次執行手續費: {session_fees:.8f} {self.quote_asset}")
             logger.info(f"本次執行凈利潤: {session_net_pnl:.8f} {self.quote_asset}")
@@ -1295,14 +1406,14 @@ class MarketMaker:
             logger.info(f"本次執行Taker買入: {self.session_taker_buy_volume} {self.base_asset}, Taker賣出: {self.session_taker_sell_volume} {self.base_asset}")
             
         else:
-            logger.info(f"無法估算潛在利潤: 缺少活躍的買/賣訂單")
+            logger.info("無法估算潛在利潤: 缺少活躍的買/賣訂單")
             logger.info(f"已實現利潤(總): {realized_pnl:.8f} {self.quote_asset}")
             logger.info(f"總手續費(總): {total_fees:.8f} {self.quote_asset}")
             logger.info(f"凈利潤(總): {net_pnl:.8f} {self.quote_asset}")
             logger.info(f"未實現利潤: {unrealized_pnl:.8f} {self.quote_asset}")
             
             # 打印本次執行的統計信息
-            logger.info(f"\n---本次執行統計---")
+            logger.info("\n---本次執行統計---")
             logger.info(f"本次執行已實現利潤: {session_realized_pnl:.8f} {self.quote_asset}")
             logger.info(f"本次執行手續費: {session_fees:.8f} {self.quote_asset}")
             logger.info(f"本次執行凈利潤: {session_net_pnl:.8f} {self.quote_asset}")
@@ -1369,7 +1480,7 @@ class MarketMaker:
                 total_volume = total_maker_buy + total_maker_sell + total_taker_buy + total_taker_sell
                 maker_percentage = ((total_maker_buy + total_maker_sell) / total_volume * 100) if total_volume > 0 else 0
                 
-                logger.info(f"\n累計統計:")
+                logger.info("\n累計統計:")
                 logger.info(f"Maker買入量: {total_maker_buy} {self.base_asset}")
                 logger.info(f"Maker賣出量: {total_maker_sell} {self.base_asset}")
                 logger.info(f"Taker買入量: {total_taker_buy} {self.base_asset}")
@@ -1430,6 +1541,235 @@ class MarketMaker:
             logger.info("重新訂閲私有訂單更新流...")
             self.subscribe_order_updates()
     
+    def analyze_market_conditions(self):
+        """分析市场状况并调整参数"""
+        try:
+            # 获取当前时间
+            current_time = time.time()
+            
+            # 如果距离上次分析时间不足5分钟，则跳过
+            if hasattr(self, 'last_analysis_time') and current_time - self.last_analysis_time < 300:
+                return
+            
+            self.last_analysis_time = current_time
+            
+            # 计算市场波动率
+            volatility = self._calculate_volatility()
+            
+            # 计算市场趋势
+            trend = self._calculate_trend()
+            
+            # 计算市场深度得分
+            depth_score = self._calculate_depth_score()
+            
+            # 计算成交量水平
+            volume_level = self._calculate_volume_level()
+            
+            # 计算当前点差水平
+            spread_level = self._calculate_spread_level()
+            
+            # 更新市场状态
+            self.market_state = {
+                'volatility': volatility,
+                'trend': trend,
+                'depth_score': depth_score,
+                'volume_level': volume_level,
+                'spread_level': spread_level
+            }
+            
+            # 根据市场状态调整参数
+            self._adjust_parameters()
+            
+            logger.info("\n市场分析结果:")
+            logger.info(f"波动率: {volatility:.4f}")
+            logger.info(f"趋势: {trend:.4f}")
+            logger.info(f"深度得分: {depth_score:.4f}")
+            logger.info(f"成交量水平: {volume_level:.4f}")
+            logger.info(f"点差水平: {spread_level:.4f}")
+            
+        except Exception as e:
+            logger.error(f"市场分析出错: {str(e)}")
+            
+    def _calculate_volatility(self):
+        """计算市场波动率"""
+        try:
+            # 获取最近的K线数据
+            klines = self.get_recent_klines(interval='1m', limit=30)
+            if not klines:
+                return 0.0
+                
+            # 计算收盘价的标准差
+            closes = [float(k[4]) for k in klines]
+            std_dev = np.std(closes)
+            mean_price = np.mean(closes)
+            
+            # 返回波动率（标准差/均价）
+            return std_dev / mean_price if mean_price > 0 else 0.0
+            
+        except Exception as e:
+            logger.error(f"计算波动率出错: {str(e)}")
+            return 0.0
+            
+    def _calculate_trend(self):
+        """计算市场趋势"""
+        try:
+            # 获取最近的K线数据
+            klines = self.get_recent_klines(interval='5m', limit=12)
+            if not klines:
+                return 0.0
+                
+            # 计算简单移动平均线
+            closes = [float(k[4]) for k in klines]
+            sma_5 = np.mean(closes[-5:])
+            sma_12 = np.mean(closes)
+            
+            # 计算趋势强度 (-1到1之间)
+            trend = (sma_5 - sma_12) / sma_12 if sma_12 > 0 else 0.0
+            return max(min(trend, 1.0), -1.0)
+            
+        except Exception as e:
+            logger.error(f"计算趋势出错: {str(e)}")
+            return 0.0
+            
+    def _calculate_depth_score(self):
+        """计算市场深度得分"""
+        try:
+            if not self.ws.orderbook:
+                return 0.0
+                
+            bids = self.ws.orderbook['bids']
+            asks = self.ws.orderbook['asks']
+            
+            if not bids or not asks:
+                return 0.0
+                
+            # 计算买卖盘的深度
+            bid_depth = sum(float(qty) for price, qty in bids[:10])
+            ask_depth = sum(float(qty) for price, qty in asks[:10])
+            
+            # 计算深度比率
+            total_depth = bid_depth + ask_depth
+            if total_depth == 0:
+                return 0.0
+                
+            # 返回深度得分 (0到1之间)
+            depth_ratio = min(bid_depth, ask_depth) / max(bid_depth, ask_depth)
+            return depth_ratio
+            
+        except Exception as e:
+            logger.error(f"计算深度得分出错: {str(e)}")
+            return 0.0
+            
+    def _calculate_volume_level(self):
+        """计算成交量水平"""
+        try:
+            # 获取最近的K线数据
+            klines = self.get_recent_klines(interval='1m', limit=30)
+            if not klines:
+                return 0.0
+                
+            # 计算平均成交量
+            volumes = [float(k[5]) for k in klines]
+            avg_volume = np.mean(volumes)
+            max_volume = max(volumes)
+            
+            # 返回成交量水平 (0到1之间)
+            return avg_volume / max_volume if max_volume > 0 else 0.0
+            
+        except Exception as e:
+            logger.error(f"计算成交量水平出错: {str(e)}")
+            return 0.0
+            
+    def _calculate_spread_level(self):
+        """计算当前点差水平"""
+        try:
+            if not self.ws.orderbook:
+                return 0.0
+                
+            bids = self.ws.orderbook['bids']
+            asks = self.ws.orderbook['asks']
+            
+            if not bids or not asks:
+                return 0.0
+                
+            # 计算当前点差
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            
+            # 计算点差比率
+            spread = (best_ask - best_bid) / best_bid if best_bid > 0 else 0.0
+            
+            # 返回标准化的点差水平 (0到1之间)
+            return min(spread / self.max_spread, 1.0)
+            
+        except Exception as e:
+            logger.error(f"计算点差水平出错: {str(e)}")
+            return 0.0
+            
+    def _adjust_parameters(self):
+        """根据市场状态调整参数"""
+        try:
+            # 计算市场得分
+            market_score = (
+                self.market_state['depth_score'] * 0.3 +
+                self.market_state['volume_level'] * 0.3 +
+                (1 - self.market_state['volatility']) * 0.2 +
+                (1 - self.market_state['spread_level']) * 0.2
+            )
+            
+            # 根据市场得分调整参数
+            self.base_spread_percentage = self._interpolate(
+                self.param_ranges['base_spread'][0],
+                self.param_ranges['base_spread'][1],
+                market_score
+            )
+            
+            self.max_orders = int(self._interpolate(
+                self.param_ranges['orders'][0],
+                self.param_ranges['orders'][1],
+                market_score
+            ))
+            
+            self.min_profit_multiplier = self._interpolate(
+                self.param_ranges['profit_multiplier'][0],
+                self.param_ranges['profit_multiplier'][1],
+                market_score
+            )
+            
+            self.max_position_size = self._interpolate(
+                self.param_ranges['position_size'][0],
+                self.param_ranges['position_size'][1],
+                market_score
+            )
+            
+            # 特殊情况处理
+            if self.market_state['volatility'] > 0.05:  # 高波动
+                self.base_spread_percentage *= 1.5
+                self.max_orders = max(2, self.max_orders // 2)
+                
+            if abs(self.market_state['trend']) > 0.8:  # 明显趋势
+                trend_direction = 1 if self.market_state['trend'] > 0 else -1
+                self.aggressive_factor = self._interpolate(
+                    self.param_ranges['aggressive'][0],
+                    self.param_ranges['aggressive'][1],
+                    0.7 + 0.3 * trend_direction
+                )
+            
+            logger.info("\n参数调整结果:")
+            logger.info(f"市场得分: {market_score:.4f}")
+            logger.info(f"基础点差: {self.base_spread_percentage:.4f}%")
+            logger.info(f"最大订单数: {self.max_orders}")
+            logger.info(f"最小利润乘数: {self.min_profit_multiplier:.4f}")
+            logger.info(f"最大仓位: {self.max_position_size:.4f}")
+            logger.info(f"进攻因子: {self.aggressive_factor:.4f}")
+            
+        except Exception as e:
+            logger.error(f"调整参数出错: {str(e)}")
+            
+    def _interpolate(self, min_val, max_val, score):
+        """线性插值计算参数值"""
+        return min_val + (max_val - min_val) * score
+
     def run(self, duration_seconds=3600, interval_seconds=60):
         """執行做市策略"""
         logger.info(f"開始運行做市策略: {self.symbol}")
@@ -1472,134 +1812,59 @@ class MarketMaker:
                 logger.info(f"\n=== 第 {iteration} 次迭代 ===")
                 logger.info(f"時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 
-                # 檢查連接並在必要時重連
+                # 检查连接并在必要时重连
                 connection_status = self.check_ws_connection()
                 
-                # 如果連接成功，檢查並確保所有流訂閲
+                # 如果连接成功，检查并确保所有流订阅
                 if connection_status:
-                    # 重新訂閲必要的數據流
+                    # 重新订阅必要的数据流
                     self._ensure_data_streams()
                 
-                # 檢查訂單成交情況
+                # 分析市场状况并调整参数
+                self.analyze_market_conditions()
+                
+                # 检查订单成交情况
                 self.check_order_fills()
                 
-                # 檢查是否需要重平衡倉位
+                # 检查是否需要重平衡仓位
                 if self.need_rebalance():
                     self.rebalance_position()
                 
-                # 下限價單
+                # 下限价单
                 self.place_limit_orders()
                 
-                # 估算利潤
+                # 估算利润
                 self.estimate_profit()
                 
-                # 定期打印交易統計報表
+                # 定期打印交易统计报表
                 if current_time - last_report_time >= report_interval:
                     self.print_trading_stats()
                     last_report_time = current_time
                 
-                # 計算總的PnL和本次執行的PnL
+                # 计算总的PnL和本次执行的PnL
                 realized_pnl, unrealized_pnl, total_fees, net_pnl, session_realized_pnl, session_fees, session_net_pnl = self.calculate_pnl()
                 
-                logger.info(f"\n統計信息:")
-                logger.info(f"總交易次數: {self.trades_executed}")
-                logger.info(f"總下單次數: {self.orders_placed}")
-                logger.info(f"總取消訂單次數: {self.orders_cancelled}")
-                logger.info(f"買入總量: {self.total_bought} {self.base_asset}")
-                logger.info(f"賣出總量: {self.total_sold} {self.base_asset}")
-                logger.info(f"Maker買入: {self.maker_buy_volume} {self.base_asset}, Maker賣出: {self.maker_sell_volume} {self.base_asset}")
-                logger.info(f"Taker買入: {self.taker_buy_volume} {self.base_asset}, Taker賣出: {self.taker_sell_volume} {self.base_asset}")
-                logger.info(f"總手續費: {total_fees:.8f} {self.quote_asset}")
-                logger.info(f"已實現利潤: {realized_pnl:.8f} {self.quote_asset}")
-                logger.info(f"凈利潤: {net_pnl:.8f} {self.quote_asset}")
-                logger.info(f"未實現利潤: {unrealized_pnl:.8f} {self.quote_asset}")
-                logger.info(f"WebSocket連接狀態: {'已連接' if self.ws and self.ws.is_connected() else '未連接'}")
+                logger.info("\n统计信息:")
+                logger.info(f"总交易次数: {self.trades_executed}")
+                logger.info(f"总下单次数: {self.orders_placed}")
+                logger.info(f"总取消订单次数: {self.orders_cancelled}")
+                logger.info(f"买入总量: {self.total_bought} {self.base_asset}")
+                logger.info(f"卖出总量: {self.total_sold} {self.base_asset}")
+                logger.info(f"Maker买入: {self.maker_buy_volume} {self.base_asset}, Maker卖出: {self.maker_sell_volume} {self.base_asset}")
+                logger.info(f"Taker买入: {self.taker_buy_volume} {self.base_asset}, Taker卖出: {self.taker_sell_volume} {self.base_asset}")
+                logger.info(f"总手续费: {total_fees:.8f} {self.quote_asset}")
+                logger.info(f"已实现利润: {realized_pnl:.8f} {self.quote_asset}")
+                logger.info(f"净利润: {net_pnl:.8f} {self.quote_asset}")
+                logger.info(f"未实现利润: {unrealized_pnl:.8f} {self.quote_asset}")
+                logger.info(f"WebSocket连接状态: {'已连接' if self.ws and self.ws.is_connected() else '未连接'}")
                 
-                # 打印本次執行的統計數據
-                logger.info(f"\n---本次執行統計---")
+                # 打印本次执行的统计数据
+                logger.info("\n---本次执行统计---")
                 session_buy_volume = sum(qty for _, qty in self.session_buy_trades)
                 session_sell_volume = sum(qty for _, qty in self.session_sell_trades)
-                logger.info(f"買入量: {session_buy_volume} {self.base_asset}, 賣出量: {session_sell_volume} {self.base_asset}")
-                logger.info(f"Maker買入: {self.session_maker_buy_volume} {self.base_asset}, Maker賣出: {self.session_maker_sell_volume} {self.base_asset}")
-                logger.info(f"Taker買入: {self.session_taker_buy_volume} {self.base_asset}, Taker賣出: {self.session_taker_sell_volume} {self.base_asset}")
-                logger.info(f"本次執行已實現利潤: {session_realized_pnl:.8f} {self.quote_asset}")
-                logger.info(f"本次執行手續費: {session_fees:.8f} {self.quote_asset}")
-                logger.info(f"本次執行凈利潤: {session_net_pnl:.8f} {self.quote_asset}")
-                
-                wait_time = interval_seconds
-                logger.info(f"等待 {wait_time} 秒後進行下一次迭代...")
-                time.sleep(wait_time)
-                
-            # 結束運行時打印最終報表
-            logger.info("\n=== 做市策略運行結束 ===")
-            self.print_trading_stats()
-            
-            # 打印本次執行的最終統計摘要
-            logger.info("\n=== 本次執行統計摘要 ===")
-            session_buy_volume = sum(qty for _, qty in self.session_buy_trades)
-            session_sell_volume = sum(qty for _, qty in self.session_sell_trades)
-            session_total_volume = session_buy_volume + session_sell_volume
-            session_profit = self._calculate_session_profit()
-            
-            # 計算執行時間
-            td = datetime.now() - self.session_start_time
-            total_seconds = int(td.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            seconds = total_seconds % 60
-            run_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-            logger.info(f"執行時間: {run_time}")
-            
-            logger.info(f"總成交量: {session_total_volume} {self.base_asset}")
-            logger.info(f"買入量: {session_buy_volume} {self.base_asset}, 賣出量: {session_sell_volume} {self.base_asset}")
-            logger.info(f"Maker買入: {self.session_maker_buy_volume} {self.base_asset}, Maker賣出: {self.session_maker_sell_volume} {self.base_asset}")
-            logger.info(f"Taker買入: {self.session_taker_buy_volume} {self.base_asset}, Taker賣出: {self.session_taker_sell_volume} {self.base_asset}")
-            logger.info(f"已實現利潤: {session_profit:.8f} {self.quote_asset}")
-            logger.info(f"總手續費: {self.session_fees:.8f} {self.quote_asset}")
-            logger.info(f"凈利潤: {(session_profit - self.session_fees):.8f} {self.quote_asset}")
-            
-            if session_total_volume > 0:
-                logger.info(f"每單位成交量利潤: {((session_profit - self.session_fees) / session_total_volume):.8f} {self.quote_asset}/{self.base_asset}")
-        
-        except KeyboardInterrupt:
-            logger.info("\n用户中斷，停止做市")
-            
-            # 中斷時也打印本次執行的統計數據
-            logger.info("\n=== 本次執行統計摘要(中斷) ===")
-            session_buy_volume = sum(qty for _, qty in self.session_buy_trades)
-            session_sell_volume = sum(qty for _, qty in self.session_sell_trades)
-            session_total_volume = session_buy_volume + session_sell_volume
-            session_profit = self._calculate_session_profit()
-            
-            # 計算執行時間
-            td = datetime.now() - self.session_start_time
-            total_seconds = int(td.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            seconds = total_seconds % 60
-            run_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-            logger.info(f"執行時間: {run_time}")
-            
-            logger.info(f"總成交量: {session_total_volume} {self.base_asset}")
-            logger.info(f"買入量: {session_buy_volume} {self.base_asset}, 賣出量: {session_sell_volume} {self.base_asset}")
-            logger.info(f"Maker買入: {self.session_maker_buy_volume} {self.base_asset}, Maker賣出: {self.session_maker_sell_volume} {self.base_asset}")
-            logger.info(f"Taker買入: {self.session_taker_buy_volume} {self.base_asset}, Taker賣出: {self.session_taker_sell_volume} {self.base_asset}")
-            logger.info(f"已實現利潤: {session_profit:.8f} {self.quote_asset}")
-            logger.info(f"總手續費: {self.session_fees:.8f} {self.quote_asset}")
-            logger.info(f"凈利潤: {(session_profit - self.session_fees):.8f} {self.quote_asset}")
-            
-            if session_total_volume > 0:
-                logger.info(f"每單位成交量利潤: {((session_profit - self.session_fees) / session_total_volume):.8f} {self.quote_asset}/{self.base_asset}")
-        
-        finally:
-            logger.info("取消所有未成交訂單...")
-            self.cancel_existing_orders()
-            
-            # 關閉 WebSocket
-            if self.ws:
-                self.ws.close()
-            
-            # 關閉數據庫連接
-            if self.db:
-                self.db.close()
-                logger.info("數據庫連接已關閉")
+                logger.info(f"买入量: {session_buy_volume} {self.base_asset}, 卖出量: {session_sell_volume} {self.base_asset}")
+                logger.info(f"Maker买入: {self.session_maker_buy_volume} {self.base_asset}, Maker卖出: {self.session_maker_sell_volume} {self.base_asset}")
+                time.sleep(interval_seconds)
+        except Exception as e:
+            logger.error(f"策略运行出错: {e}")
+            raise
