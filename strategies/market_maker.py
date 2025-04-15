@@ -1042,157 +1042,93 @@ class MarketMaker:
             logger.info(f"已經訂閲了訂單更新: {stream}")
             return True
     
-    def place_limit_orders(self):
-        """下限价单"""
-        self.check_ws_connection()
-        self.cancel_existing_orders()
-        
-        # 获取买卖价格
-        buy_price, sell_price = self.calculate_prices()
-        if buy_price is None or sell_price is None:
-            logger.error("無法計算訂單價格，跳過下單")
-            return
-        
-        # 获取当前余额
-        balances = get_balance(self.api_key, self.secret_key)
-        if isinstance(balances, dict) and "error" in balances:
-            logger.error(f"獲取餘額失敗: {balances['error']}")
-            return
-        
-        base_balance = 0
-        quote_balance = 0
-        for asset, balance in balances.items():
-            if asset == self.base_asset:
-                base_balance = float(balance.get('available', 0))
-            elif asset == self.quote_asset:
-                quote_balance = float(balance.get('available', 0))
-        
-        logger.info(f"當前可用餘額: {base_balance} {self.base_asset}, {quote_balance} {self.quote_asset}")
-        
-        # 处理订单数量
-        if self.order_quantity is None:
-            # 使用当前买入价格计算数量
-            avg_price = buy_price  # 修改这里，直接使用买入价格
-            
-            # 提高资金利用率，根据市场深度动态调整
-            order_book = get_order_book(self.symbol)
-            if isinstance(order_book, dict) and "error" in order_book:
-                allocation_percent = 0.05  # 默认值
-            else:
-                # 分析市场深度
-                total_bid_depth = sum(float(bid[1]) for bid in order_book['bids'][:5])
-                total_ask_depth = sum(float(ask[1]) for ask in order_book['asks'][:5])
-                avg_market_depth = (total_bid_depth + total_ask_depth) / 2
+    def place_limit_orders(self, buy_price, sell_price):
+        """
+        在指定价格放置买卖限价单
+        """
+        try:
+            # 获取当前余额
+            balances = get_balance(self.api_key, self.secret_key)
+            if isinstance(balances, dict) and "error" in balances:
+                logger.error(f"獲取餘額失敗: {balances['error']}")
+                return
                 
-                # 根据市场深度动态调整资金使用比例
-                base_allocation = 0.08  # 基础分配比例
-                depth_factor = min(1.5, max(0.8, avg_market_depth / (base_balance if base_balance > 0 else 1)))
-                allocation_percent = base_allocation * depth_factor
-                
-                # 确保总资金使用不超过50%
-                total_allocation = allocation_percent * self.max_orders
-                if total_allocation > 0.5:
-                    allocation_percent = 0.5 / self.max_orders
-
-            # 计算买入和卖出订单的最大可用数量
-            max_buy_quantity = quote_balance / avg_price / self.max_orders
-            max_sell_quantity = base_balance / self.max_orders
+            base_balance = 0
+            quote_balance = 0
             
-            # 确保买入数量不超过可用资金
+            for asset, details in balances.items():
+                if asset == self.base_asset:
+                    base_balance = float(details.get('available', 0))
+                elif asset == self.quote_asset:
+                    quote_balance = float(details.get('available', 0))
+                    
+            logger.info(f"當前余額 - {self.base_asset}: {base_balance}, {self.quote_asset}: {quote_balance}")
+            
+            if base_balance == 0 and quote_balance == 0:
+                logger.warning("賬戶余額為0，無法下單")
+                return
+                
+            # 计算买单数量
             buy_quantity = min(
-                max_buy_quantity,
-                quote_balance * allocation_percent / avg_price
+                self.order_quantity,
+                quote_balance / buy_price if buy_price > 0 else 0
             )
             buy_quantity = round_to_precision(buy_quantity, self.base_precision)
-            buy_quantity = max(self.min_order_size, buy_quantity)
             
-            # 确保卖出数量不超过可用余额
+            # 计算卖单数量
             sell_quantity = min(
-                max_sell_quantity,
-                base_balance * allocation_percent
+                self.order_quantity,
+                base_balance
             )
             sell_quantity = round_to_precision(sell_quantity, self.base_precision)
-            sell_quantity = max(self.min_order_size, sell_quantity)
             
-            # 额外检查确保不超过精度限制
-            buy_quantity = float(f"%.{self.base_precision}f" % buy_quantity)
-            sell_quantity = float(f"%.{self.base_precision}f" % sell_quantity)
-            
-            logger.info(f"计算得出订单数量 - 买入: {buy_quantity} (最大可用: {max_buy_quantity:.8f})")
-            logger.info(f"计算得出订单数量 - 卖出: {sell_quantity} (最大可用: {max_sell_quantity:.8f})")
-        else:
-            buy_quantity = round_to_precision(self.order_quantity, self.base_precision)
-            sell_quantity = round_to_precision(self.order_quantity, self.base_precision)
-            
-            # 确保不超过可用余额
-            max_buy_quantity = quote_balance / buy_price
-            max_sell_quantity = base_balance
-            
-            buy_quantity = min(buy_quantity, max_buy_quantity)
-            sell_quantity = min(sell_quantity, max_sell_quantity)
-            
-            buy_quantity = float(f"%.{self.base_precision}f" % buy_quantity)
-            sell_quantity = float(f"%.{self.base_precision}f" % sell_quantity)
-        
-        # 检查订单数量是否满足最小要求
-        if buy_quantity < self.min_order_size:
-            logger.warning(f"买入数量 {buy_quantity} 小于最小订单大小 {self.min_order_size}，跳过买单")
-            buy_quantity = 0
-        
-        if sell_quantity < self.min_order_size:
-            logger.warning(f"卖出数量 {sell_quantity} 小于最小订单大小 {self.min_order_size}，跳过卖单")
-            sell_quantity = 0
-        
-        # 下买单
-        if buy_quantity > 0:
-            # 检查剩余资金是否足够
-            required_quote = buy_price * buy_quantity
-            if required_quote > quote_balance:
-                logger.warning(f"剩余资金不足，无法下买单 (需要: {required_quote:.8f} {self.quote_asset}, 可用: {quote_balance:.8f} {self.quote_asset})")
-            else:
-                # 构建买单
-                buy_order = {
-                    "orderType": "Limit",
-                    "price": str(buy_price),
-                    "quantity": str(buy_quantity),
-                    "side": "Bid",
-                    "symbol": self.symbol,
-                    "timeInForce": "GTC",
-                    "postOnly": True
-                }
+            # 检查下单数量是否满足最小要求
+            if buy_quantity < self.min_order_size:
+                logger.warning(f"買單數量 {buy_quantity} 小於最小下單量 {self.min_order_size}")
+                buy_quantity = 0
                 
-                # 执行买单
-                buy_result = execute_order(self.api_key, self.secret_key, buy_order)
-                if isinstance(buy_result, dict) and "error" in buy_result:
-                    logger.error(f"买单执行失败: {buy_result['error']}")
-                else:
-                    logger.info(f"买单已提交: {buy_quantity} @ {buy_price}")
-                    quote_balance -= required_quote
-        
-        # 下卖单
-        if sell_quantity > 0:
-            # 检查剩余余额是否足够
-            if sell_quantity > base_balance:
-                logger.warning(f"剩余{self.base_asset}不足，无法下卖单 (需要: {sell_quantity:.8f}, 可用: {base_balance:.8f})")
-            else:
-                # 构建卖单
-                sell_order = {
-                    "orderType": "Limit",
-                    "price": str(sell_price),
-                    "quantity": str(sell_quantity),
-                    "side": "Ask",
-                    "symbol": self.symbol,
-                    "timeInForce": "GTC",
-                    "postOnly": True
-                }
+            if sell_quantity < self.min_order_size:
+                logger.warning(f"賣單數量 {sell_quantity} 小於最小下單量 {self.min_order_size}")
+                sell_quantity = 0
                 
-                # 执行卖单
-                sell_result = execute_order(self.api_key, self.secret_key, sell_order)
-                if isinstance(sell_result, dict) and "error" in sell_result:
-                    logger.error(f"卖单执行失败: {sell_result['error']}")
-                else:
-                    logger.info(f"卖单已提交: {sell_quantity} @ {sell_price}")
-                    base_balance -= sell_quantity
+            # 记录下单信息
+            logger.info(f"準備下單 - 買入: {buy_quantity}@{buy_price}, 賣出: {sell_quantity}@{sell_price}")
+            
+            # 如果买卖单数量都为0，直接返回
+            if buy_quantity == 0 and sell_quantity == 0:
+                logger.warning("沒有足夠的資金或資產進行下單")
+                return
+                
+            # 下买单
+            if buy_quantity > 0:
+                try:
+                    order = self.place_order(
+                        symbol=self.symbol,
+                        side="BUY",
+                        order_type="LIMIT",
+                        quantity=buy_quantity,
+                        price=buy_price
+                    )
+                    logger.info(f"買單已提交: {order}")
+                except Exception as e:
+                    logger.error(f"買單提交失敗: {str(e)}")
+                    
+            # 下卖单
+            if sell_quantity > 0:
+                try:
+                    order = self.place_order(
+                        symbol=self.symbol,
+                        side="SELL",
+                        order_type="LIMIT",
+                        quantity=sell_quantity,
+                        price=sell_price
+                    )
+                    logger.info(f"賣單已提交: {order}")
+                except Exception as e:
+                    logger.error(f"賣單提交失敗: {str(e)}")
+                    
+        except Exception as e:
+            logger.error(f"下單過程發生錯誤: {str(e)}")
     
     def _adjust_quantity_by_market(self, base_quantity, side):
         """根据市场情况动态调整订单数量"""
