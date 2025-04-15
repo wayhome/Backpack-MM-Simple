@@ -812,30 +812,23 @@ class MarketMaker:
             if bid_price is None or ask_price is None:
                 return None, None
             
-            mid_price = (bid_price + ask_price) / 2
-            
-            # 使用新的价差计算方法
-            spread_percentage = self.calculate_dynamic_spread()
-            exact_spread = mid_price * (spread_percentage / 100)
-            
-            # 更温和的价格调整
-            base_buy_price = mid_price - (exact_spread / 2)
-            base_sell_price = mid_price + (exact_spread / 2)
-            
-            # 确保价格合理性
-            if base_buy_price < bid_price * 0.995:  # 不要离最佳价格太远
-                base_buy_price = bid_price * 0.995
-            if base_sell_price > ask_price * 1.005:
-                base_sell_price = ask_price * 1.005
+            # 确保我们的买价低于市场最佳买价，卖价高于市场最佳卖价
+            base_buy_price = bid_price * 0.999  # 买价比市场最佳买价低0.1%
+            base_sell_price = ask_price * 1.001  # 卖价比市场最佳卖价高0.1%
             
             # 根据tick_size四舍五入价格
             base_buy_price = round_to_tick_size(base_buy_price, self.tick_size)
             base_sell_price = round_to_tick_size(base_sell_price, self.tick_size)
             
+            # 确保买卖价差合理
+            if base_sell_price <= base_buy_price:
+                logger.warning("买卖价差不合理，跳过下单")
+                return None, None
+            
             # 记录价格信息
-            logger.info(f"市场中间价: {mid_price}")
-            logger.info(f"买入价: {base_buy_price} (距离最佳买价: {((bid_price - base_buy_price) / bid_price * 100):.4f}%)")
-            logger.info(f"卖出价: {base_sell_price} (距离最佳卖价: {((base_sell_price - ask_price) / ask_price * 100):.4f}%)")
+            logger.info(f"市场买价: {bid_price}, 市场卖价: {ask_price}")
+            logger.info(f"下单买价: {base_buy_price} (比市场买价低: {((bid_price - base_buy_price) / bid_price * 100):.4f}%)")
+            logger.info(f"下单卖价: {base_sell_price} (比市场卖价高: {((base_sell_price - ask_price) / ask_price * 100):.4f}%)")
             
             return base_buy_price, base_sell_price
         
@@ -844,175 +837,203 @@ class MarketMaker:
             return None, None
     
     def need_rebalance(self):
-        """判斷是否需要重平衡倉位"""
+        """判断是否需要重平衡仓位"""
         if self.total_bought == 0 and self.total_sold == 0:
             return False
             
-        # 計算淨部位
+        # 计算净部位
         net_position = self.total_bought - self.total_sold
         if net_position == 0:
             return False
             
-        # 獲取當前賬戶餘額
+        # 获取当前账户余额
         balances = get_balance(self.api_key, self.secret_key)
         if isinstance(balances, dict) and "error" in balances:
-            logger.error(f"獲取餘額失敗: {balances['error']}")
-            # 如果無法獲取餘額，則使用舊方法
-            imbalance_percentage = abs(net_position) / max(self.total_bought, self.total_sold) * 100
-            return imbalance_percentage > self.rebalance_threshold
+            logger.error(f"获取余额失败: {balances['error']}")
+            return False  # 如果无法获取余额，不进行重平衡
             
-        # 計算總資產價值（以報價貨幣計算）
+        # 计算总资产价值（以报价货币计算）
         total_assets = 0
         
-        # 獲取當前價格，用於轉換基礎貨幣到報價貨幣
+        # 获取当前价格，用于转换基础货币到报价货币
         current_price = self.get_current_price()
         if not current_price:
-            logger.warning("無法獲取當前價格，使用舊方法計算不平衡度")
-            imbalance_percentage = abs(net_position) / max(self.total_bought, self.total_sold) * 100
-            return imbalance_percentage > self.rebalance_threshold
+            logger.warning("无法获取当前价格，取消重平衡")
+            return False
         
-        # 累加所有資產價值
+        # 累加所有资产价值
         for asset, details in balances.items():
             available = float(details.get('available', 0))
             locked = float(details.get('locked', 0))
             total = available + locked
             
             if asset == self.quote_asset:
-                # 報價貨幣直接加入
+                # 报价货币直接加入
                 total_assets += total
             elif asset == self.base_asset:
-                # 基礎貨幣轉換為報價貨幣的價值
+                # 基础货币转换为报价货币的价值
                 total_assets += total * current_price
         
-        # 計算淨部位價值（以報價貨幣計）
+        # 计算净部位价值（以报价货币计）
         net_position_value = abs(net_position) * current_price
         
-        # 計算風險暴露比例
+        # 计算风险暴露比例
         risk_exposure = (net_position_value / total_assets) * 100 if total_assets > 0 else 0
         
-        logger.info(f"當前淨部位: {net_position} {self.base_asset} (價值: {net_position_value:.2f} {self.quote_asset})")
-        logger.info(f"總資產價值: {total_assets:.2f} {self.quote_asset}")
-        logger.info(f"風險暴露比例: {risk_exposure:.2f}%")
+        # 获取当前市场波动率
+        volatility = self._calculate_volatility()
         
-        return risk_exposure > self.rebalance_threshold
+        # 根据波动率动态调整重平衡阈值
+        base_threshold = self.rebalance_threshold  # 基础阈值（默认10%）
+        if volatility > 0.02:  # 高波动
+            threshold = base_threshold * 0.8  # 降低阈值，更频繁重平衡
+        else:
+            threshold = base_threshold * 1.2  # 提高阈值，减少重平衡频率
+        
+        # 检查最近是否有重平衡操作
+        current_time = time.time()
+        min_rebalance_interval = 300  # 最小重平衡间隔（5分钟）
+        
+        if hasattr(self, 'last_rebalance_time') and \
+           current_time - self.last_rebalance_time < min_rebalance_interval:
+            logger.info("距离上次重平衡时间不足5分钟，暂不重平衡")
+            return False
+        
+        # 记录重平衡判断的详细信息
+        logger.info(f"当前净部位: {net_position} {self.base_asset}")
+        logger.info(f"净部位价值: {net_position_value:.2f} {self.quote_asset}")
+        logger.info(f"总资产价值: {total_assets:.2f} {self.quote_asset}")
+        logger.info(f"风险暴露比例: {risk_exposure:.2f}%")
+        logger.info(f"当前波动率: {volatility:.4f}")
+        logger.info(f"重平衡阈值: {threshold:.2f}%")
+        
+        # 更新最后重平衡时间
+        if risk_exposure > threshold:
+            self.last_rebalance_time = current_time
+            logger.info(f"需要重平衡：风险暴露 {risk_exposure:.2f}% > 阈值 {threshold:.2f}%")
+            return True
+        
+        return False
     
     def rebalance_position(self):
-        """重平衡倉位"""
-        logger.info("開始重新平衡倉位...")
+        """重平衡仓位"""
+        logger.info("开始重新平衡仓位...")
         self.check_ws_connection()
         
         imbalance = self.total_bought - self.total_sold
         bid_price, ask_price = self.get_market_depth()
         
         if bid_price is None or ask_price is None:
-            current_price = self.get_current_price()
-            if current_price is None:
-                logger.error("無法獲取價格，無法重新平衡")
-                return
-            bid_price = current_price * 0.998
-            ask_price = current_price * 1.002
+            logger.error("无法获取市场深度，取消重平衡")
+            return
+        
+        # 获取当前价格
+        current_price = self.get_current_price()
+        if current_price is None:
+            logger.error("无法获取当前价格，取消重平衡")
+            return
         
         if imbalance > 0:
-            # 淨多頭，需要賣出
+            # 净多头，需要卖出
             quantity = round_to_precision(imbalance, self.base_precision)
             if quantity < self.min_order_size:
-                logger.info(f"不平衡量 {quantity} 低於最小訂單大小 {self.min_order_size}，不進行重新平衡")
+                logger.info(f"不平衡量 {quantity} 低于最小订单大小 {self.min_order_size}，不进行重平衡")
                 return
             
-            # 設定賣出價格
-            price_factor = 1.0
-            sell_price = round_to_tick_size(bid_price * price_factor, self.tick_size)
-            logger.info(f"執行重新平衡: 賣出 {quantity} {self.base_asset} @ {sell_price}")
+            # 设定保守的卖出价格，确保高于市场买价
+            sell_price = round_to_tick_size(bid_price * 1.001, self.tick_size)
+            logger.info(f"执行重平衡: 卖出 {quantity} {self.base_asset} @ {sell_price}")
             
-            # 構建訂單
-            order_details = {
-                "orderType": "Limit",
-                "price": str(sell_price),
-                "quantity": str(quantity),
-                "side": "Ask",
-                "symbol": self.symbol,
-                "timeInForce": "GTC",
-                "postOnly": True
-            }
+            # 分批卖出，降低市场影响
+            batch_size = quantity / 3  # 分3次卖出
+            batch_size = round_to_precision(batch_size, self.base_precision)
             
-            # 嘗試執行訂單
-            result = execute_order(self.api_key, self.secret_key, order_details)
+            if batch_size < self.min_order_size:
+                batch_size = quantity  # 如果分批后小于最小订单量，则一次性卖出
             
-            # 處理可能的錯誤
-            if isinstance(result, dict) and "error" in result:
-                error_msg = str(result['error'])
-                logger.error(f"重新平衡賣單執行失敗: {error_msg}")
+            remaining_quantity = quantity
+            while remaining_quantity >= self.min_order_size:
+                current_batch = min(batch_size, remaining_quantity)
+                current_batch = round_to_precision(current_batch, self.base_precision)
                 
-                # 如果因為訂單會立即成交而失敗，嘗試不使用postOnly
-                if "POST_ONLY_TAKER" in error_msg or "Order would immediately match" in error_msg:
-                    logger.info("嘗試使用非postOnly訂單進行重新平衡...")
-                    order_details.pop("postOnly", None)
-                    result = execute_order(self.api_key, self.secret_key, order_details)
-                    
-                    if isinstance(result, dict) and "error" in result:
-                        logger.error(f"非postOnly賣單執行失敗: {result['error']}")
-                    else:
-                        logger.info(f"非postOnly賣單執行成功，價格: {sell_price}")
-                        # 記錄這是一個重平衡訂單
-                        if 'id' in result:
-                            self.db.record_rebalance_order(result['id'], self.symbol)
-            else:
-                logger.info("重新平衡賣單已提交，作為maker")
-                # 記錄這是一個重平衡訂單
-                if 'id' in result:
-                    self.db.record_rebalance_order(result['id'], self.symbol)
-            
+                # 再次检查价格，确保卖价合理
+                new_bid_price, _ = self.get_market_depth()
+                if new_bid_price and new_bid_price > sell_price:
+                    sell_price = round_to_tick_size(new_bid_price * 1.001, self.tick_size)
+                
+                order_details = {
+                    "orderType": "Limit",
+                    "price": str(sell_price),
+                    "quantity": str(current_batch),
+                    "side": "Ask",
+                    "symbol": self.symbol,
+                    "timeInForce": "GTC",
+                    "postOnly": True
+                }
+                
+                result = execute_order(self.api_key, self.secret_key, order_details)
+                if isinstance(result, dict) and "error" in result:
+                    logger.error(f"重平衡卖单执行失败: {result['error']}")
+                    break
+                else:
+                    logger.info(f"重平衡卖单已提交: 数量={current_batch}, 价格={sell_price}")
+                    if 'id' in result:
+                        self.db.record_rebalance_order(result['id'], self.symbol)
+                    remaining_quantity -= current_batch
+                
+                time.sleep(1)  # 等待一秒再下一个订单
+                
         elif imbalance < 0:
-            # 淨空頭，需要買入
+            # 净空头，需要买入
             quantity = round_to_precision(abs(imbalance), self.base_precision)
             if quantity < self.min_order_size:
-                logger.info(f"不平衡量 {quantity} 低於最小訂單大小 {self.min_order_size}，不進行重新平衡")
+                logger.info(f"不平衡量 {quantity} 低于最小订单大小 {self.min_order_size}，不进行重平衡")
                 return
             
-            # 設定買入價格
-            price_factor = 1.0
-            buy_price = round_to_tick_size(ask_price * price_factor, self.tick_size)
-            logger.info(f"執行重新平衡: 買入 {quantity} {self.base_asset} @ {buy_price}")
+            # 设定保守的买入价格，确保低于市场卖价
+            buy_price = round_to_tick_size(ask_price * 0.999, self.tick_size)
+            logger.info(f"执行重平衡: 买入 {quantity} {self.base_asset} @ {buy_price}")
             
-            # 構建訂單
-            order_details = {
-                "orderType": "Limit",
-                "price": str(buy_price),
-                "quantity": str(quantity),
-                "side": "Bid",
-                "symbol": self.symbol,
-                "timeInForce": "GTC",
-                "postOnly": True
-            }
+            # 分批买入，降低市场影响
+            batch_size = quantity / 3  # 分3次买入
+            batch_size = round_to_precision(batch_size, self.base_precision)
             
-            # 嘗試執行訂單
-            result = execute_order(self.api_key, self.secret_key, order_details)
+            if batch_size < self.min_order_size:
+                batch_size = quantity  # 如果分批后小于最小订单量，则一次性买入
             
-            # 處理可能的錯誤
-            if isinstance(result, dict) and "error" in result:
-                error_msg = str(result['error'])
-                logger.error(f"重新平衡買單執行失敗: {error_msg}")
+            remaining_quantity = quantity
+            while remaining_quantity >= self.min_order_size:
+                current_batch = min(batch_size, remaining_quantity)
+                current_batch = round_to_precision(current_batch, self.base_precision)
                 
-                # 如果因為訂單會立即成交而失敗，嘗試不使用postOnly
-                if "POST_ONLY_TAKER" in error_msg or "Order would immediately match" in error_msg:
-                    logger.info("嘗試使用非postOnly訂單進行重新平衡...")
-                    order_details.pop("postOnly", None)
-                    result = execute_order(self.api_key, self.secret_key, order_details)
-                    
-                    if isinstance(result, dict) and "error" in result:
-                        logger.error(f"非postOnly買單執行失敗: {result['error']}")
-                    else:
-                        logger.info(f"非postOnly買單執行成功，價格: {buy_price}")
-                        # 記錄這是一個重平衡訂單
-                        if 'id' in result:
-                            self.db.record_rebalance_order(result['id'], self.symbol)
-            else:
-                logger.info("重平衡買單已提交，作為maker")
-                # 記錄這是一個重平衡訂單
-                if 'id' in result:
-                    self.db.record_rebalance_order(result['id'], self.symbol)
+                # 再次检查价格，确保买价合理
+                _, new_ask_price = self.get_market_depth()
+                if new_ask_price and new_ask_price < buy_price:
+                    buy_price = round_to_tick_size(new_ask_price * 0.999, self.tick_size)
+                
+                order_details = {
+                    "orderType": "Limit",
+                    "price": str(buy_price),
+                    "quantity": str(current_batch),
+                    "side": "Bid",
+                    "symbol": self.symbol,
+                    "timeInForce": "GTC",
+                    "postOnly": True
+                }
+                
+                result = execute_order(self.api_key, self.secret_key, order_details)
+                if isinstance(result, dict) and "error" in result:
+                    logger.error(f"重平衡买单执行失败: {result['error']}")
+                    break
+                else:
+                    logger.info(f"重平衡买单已提交: 数量={current_batch}, 价格={buy_price}")
+                    if 'id' in result:
+                        self.db.record_rebalance_order(result['id'], self.symbol)
+                    remaining_quantity -= current_batch
+                
+                time.sleep(1)  # 等待一秒再下一个订单
         
-        logger.info("倉位重新平衡完成")
+        logger.info("仓位重新平衡完成")
     
     def subscribe_order_updates(self):
         """訂閲訂單更新流"""
@@ -1051,20 +1072,30 @@ class MarketMaker:
     
     def place_limit_orders(self):
         """下限价单"""
-        self.check_ws_connection()
-        self.cancel_existing_orders()
-        
-        # 获取买卖价格
-        buy_price, sell_price = self.calculate_prices()
-        if buy_price is None or sell_price is None:
-            logger.error("無法計算訂單價格，跳過下單")
-            return
-            
         try:
-            # 获取当前余额
+            # 1. 先检查WebSocket连接
+            self.check_ws_connection()
+            
+            # 2. 取消所有现有订单并等待确认
+            self.cancel_existing_orders()
+            time.sleep(1)  # 等待订单取消完成
+            
+            # 3. 再次检查确保没有未完成的订单
+            open_orders = get_open_orders(self.api_key, self.secret_key, self.symbol)
+            if open_orders and len(open_orders) > 0:
+                logger.warning(f"仍有 {len(open_orders)} 个未取消的订单，暂停本轮下单")
+                return
+            
+            # 4. 获取最新市场价格并计算下单价格
+            buy_price, sell_price = self.calculate_prices()
+            if buy_price is None or sell_price is None:
+                logger.error("无法计算订单价格，跳过下单")
+                return
+                
+            # 5. 获取最新账户余额
             balances = get_balance(self.api_key, self.secret_key)
             if isinstance(balances, dict) and "error" in balances:
-                logger.error(f"獲取餘額失敗: {balances['error']}")
+                logger.error(f"获取余额失败: {balances['error']}")
                 return
                 
             base_balance = 0
@@ -1076,36 +1107,19 @@ class MarketMaker:
                 elif asset == self.quote_asset:
                     quote_balance = float(details.get('available', 0))
                     
-            logger.info(f"當前余額 - {self.base_asset}: {base_balance}, {self.quote_asset}: {quote_balance}")
+            logger.info(f"当前余额 - {self.base_asset}: {base_balance}, {self.quote_asset}: {quote_balance}")
             
             if base_balance == 0 and quote_balance == 0:
-                logger.warning("賬戶余額為0，無法下單")
+                logger.warning("账户余额为0，无法下单")
                 return
                 
-            # 如果order_quantity为None，根据余额计算合适的订单数量
+            # 6. 计算下单数量
             if self.order_quantity is None:
                 # 使用当前买入价格计算数量
-                avg_price = buy_price  # 修改这里，直接使用买入价格
+                avg_price = buy_price
                 
-                # 提高资金利用率，根据市场深度动态调整
-                order_book = get_order_book(self.symbol)
-                if isinstance(order_book, dict) and "error" in order_book:
-                    allocation_percent = 0.05  # 默认值
-                else:
-                    # 分析市场深度
-                    total_bid_depth = sum(float(bid[1]) for bid in order_book['bids'][:5])
-                    total_ask_depth = sum(float(ask[1]) for ask in order_book['asks'][:5])
-                    avg_market_depth = (total_bid_depth + total_ask_depth) / 2
-                    
-                    # 根据市场深度动态调整资金使用比例
-                    base_allocation = 0.08  # 基础分配比例
-                    depth_factor = min(1.5, max(0.8, avg_market_depth / (base_balance if base_balance > 0 else 1)))
-                    allocation_percent = base_allocation * depth_factor
-                    
-                    # 确保总资金使用不超过50%
-                    total_allocation = allocation_percent * self.max_orders
-                    if total_allocation > 0.5:
-                        allocation_percent = 0.5 / self.max_orders
+                # 保守的资金使用比例
+                allocation_percent = 0.05  # 使用5%的可用资金
                 
                 # 计算买入和卖出订单的最大可用数量
                 max_buy_quantity = quote_balance / avg_price / self.max_orders
@@ -1126,41 +1140,46 @@ class MarketMaker:
                 sell_quantity = round_to_precision(sell_quantity, self.base_precision)
             else:
                 # 使用固定的order_quantity
-                # 计算买单数量
                 buy_quantity = min(
                     self.order_quantity,
                     quote_balance / buy_price if buy_price > 0 else 0
                 )
                 buy_quantity = round_to_precision(buy_quantity, self.base_precision)
                 
-                # 计算卖单数量
                 sell_quantity = min(
                     self.order_quantity,
                     base_balance
                 )
                 sell_quantity = round_to_precision(sell_quantity, self.base_precision)
             
-            # 检查下单数量是否满足最小要求
+            # 7. 检查下单数量是否满足最小要求
             if buy_quantity < self.min_order_size:
-                logger.warning(f"買單數量 {buy_quantity} 小於最小下單量 {self.min_order_size}")
+                logger.warning(f"买单数量 {buy_quantity} 小于最小下单量 {self.min_order_size}")
                 buy_quantity = 0
                 
             if sell_quantity < self.min_order_size:
-                logger.warning(f"賣單數量 {sell_quantity} 小於最小下單量 {self.min_order_size}")
+                logger.warning(f"卖单数量 {sell_quantity} 小于最小下单量 {self.min_order_size}")
                 sell_quantity = 0
                 
-            # 记录下单信息
-            logger.info(f"準備下單 - 買入: {buy_quantity}@{buy_price}, 賣出: {sell_quantity}@{sell_price}")
+            # 8. 记录下单信息
+            logger.info(f"准备下单 - 买入: {buy_quantity}@{buy_price}, 卖出: {sell_quantity}@{sell_price}")
             
             # 如果买卖单数量都为0，直接返回
             if buy_quantity == 0 and sell_quantity == 0:
-                logger.warning("沒有足夠的資金或資產進行下單")
+                logger.warning("没有足够的资金或资产进行下单")
                 return
                 
-            # 下买单
+            # 9. 执行下单，确保价格合理
+            current_price = self.get_current_price()
+            if current_price:
+                # 再次验证价格合理性
+                if buy_price >= current_price or sell_price <= current_price:
+                    logger.warning("价格已经不合理，取消本轮下单")
+                    return
+            
+            # 10. 下买单
             if buy_quantity > 0:
                 try:
-                    # 构建买单
                     buy_order = {
                         "orderType": "Limit",
                         "price": str(buy_price),
@@ -1171,20 +1190,18 @@ class MarketMaker:
                         "postOnly": True
                     }
                     
-                    # 执行买单
                     result = execute_order(self.api_key, self.secret_key, buy_order)
                     if isinstance(result, dict) and "error" in result:
-                        logger.error(f"買單執行失敗: {result['error']}")
+                        logger.error(f"买单执行失败: {result['error']}")
                     else:
-                        logger.info(f"買單已提交: {result}")
+                        logger.info(f"买单已提交: {result}")
                         self.orders_placed += 1
                 except Exception as e:
-                    logger.error(f"買單提交失敗: {str(e)}")
+                    logger.error(f"买单提交失败: {str(e)}")
                     
-            # 下卖单
+            # 11. 下卖单
             if sell_quantity > 0:
                 try:
-                    # 构建卖单
                     sell_order = {
                         "orderType": "Limit",
                         "price": str(sell_price),
@@ -1195,18 +1212,19 @@ class MarketMaker:
                         "postOnly": True
                     }
                     
-                    # 执行卖单
                     result = execute_order(self.api_key, self.secret_key, sell_order)
                     if isinstance(result, dict) and "error" in result:
-                        logger.error(f"賣單執行失敗: {result['error']}")
+                        logger.error(f"卖单执行失败: {result['error']}")
                     else:
-                        logger.info(f"賣單已提交: {result}")
+                        logger.info(f"卖单已提交: {result}")
                         self.orders_placed += 1
                 except Exception as e:
-                    logger.error(f"賣單提交失敗: {str(e)}")
+                    logger.error(f"卖单提交失败: {str(e)}")
                     
         except Exception as e:
-            logger.error(f"下單過程發生錯誤: {str(e)}")
+            logger.error(f"下单过程发生错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def _adjust_quantity_by_market(self, base_quantity, side):
         """根据市场情况动态调整订单数量"""
