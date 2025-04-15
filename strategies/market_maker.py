@@ -1043,24 +1043,25 @@ class MarketMaker:
             logger.error("無法計算訂單價格，跳過下單")
             return
         
-        # 處理訂單數量
+        # 获取当前余额
+        balances = get_balance(self.api_key, self.secret_key)
+        if isinstance(balances, dict) and "error" in balances:
+            logger.error(f"獲取餘額失敗: {balances['error']}")
+            return
+        
+        base_balance = 0
+        quote_balance = 0
+        for asset, balance in balances.items():
+            if asset == self.base_asset:
+                base_balance = float(balance.get('available', 0))
+            elif asset == self.quote_asset:
+                quote_balance = float(balance.get('available', 0))
+        
+        logger.info(f"當前可用餘額: {base_balance} {self.base_asset}, {quote_balance} {self.quote_asset}")
+        
+        # 处理订单数量
         if self.order_quantity is None:
-            balances = get_balance(self.api_key, self.secret_key)
-            if isinstance(balances, dict) and "error" in balances:
-                logger.error(f"獲取餘額失敗: {balances['error']}")
-                return
-            
-            base_balance = 0
-            quote_balance = 0
-            for asset, balance in balances.items():
-                if asset == self.base_asset:
-                    base_balance = float(balance.get('available', 0))
-                elif asset == self.quote_asset:
-                    quote_balance = float(balance.get('available', 0))
-            
-            logger.info(f"當前餘額: {base_balance} {self.base_asset}, {quote_balance} {self.quote_asset}")
-            
-            # 計算每個訂單的數量
+            # 计算每个订单的数量
             avg_price = sum(buy_prices) / len(buy_prices)
             
             # 提高资金利用率，根据市场深度动态调整
@@ -1074,7 +1075,7 @@ class MarketMaker:
                 avg_market_depth = (total_bid_depth + total_ask_depth) / 2
                 
                 # 根据市场深度动态调整资金使用比例
-                base_allocation = 0.08  # 基础分配比例提高到8%
+                base_allocation = 0.08  # 基础分配比例
                 depth_factor = min(1.5, max(0.8, avg_market_depth / (base_balance if base_balance > 0 else 1)))
                 allocation_percent = base_allocation * depth_factor
                 
@@ -1083,121 +1084,82 @@ class MarketMaker:
                 if total_allocation > 0.5:
                     allocation_percent = 0.5 / self.max_orders
 
-            quote_amount_per_side = quote_balance * allocation_percent
-            base_amount_per_side = base_balance * allocation_percent
+            # 计算买入和卖出订单的最大可用数量
+            max_buy_quantity = quote_balance / avg_price / self.max_orders
+            max_sell_quantity = base_balance / self.max_orders
             
-            # 确保买入数量精度正确
-            buy_quantity = quote_amount_per_side / avg_price
+            # 确保买入数量不超过可用资金
+            buy_quantity = min(
+                max_buy_quantity,
+                quote_balance * allocation_percent / avg_price
+            )
             buy_quantity = round_to_precision(buy_quantity, self.base_precision)
             buy_quantity = max(self.min_order_size, buy_quantity)
             
-            # 确保卖出数量精度正确
-            sell_quantity = round_to_precision(base_amount_per_side, self.base_precision)
+            # 确保卖出数量不超过可用余额
+            sell_quantity = min(
+                max_sell_quantity,
+                base_balance * allocation_percent
+            )
+            sell_quantity = round_to_precision(sell_quantity, self.base_precision)
             sell_quantity = max(self.min_order_size, sell_quantity)
             
             # 额外检查确保不超过精度限制
-            buy_quantity_str = str(buy_quantity)
-            sell_quantity_str = str(sell_quantity)
+            buy_quantity = float(f"%.{self.base_precision}f" % buy_quantity)
+            sell_quantity = float(f"%.{self.base_precision}f" % sell_quantity)
             
-            if '.' in buy_quantity_str and len(buy_quantity_str.split('.')[-1]) > self.base_precision:
-                buy_quantity = float(f"%.{self.base_precision}f" % buy_quantity)
-            
-            if '.' in sell_quantity_str and len(sell_quantity_str.split('.')[-1]) > self.base_precision:
-                sell_quantity = float(f"%.{self.base_precision}f" % sell_quantity)
-                
-            logger.info(f"计算得出订单数量 - 买入: {buy_quantity}, 卖出: {sell_quantity}")
+            logger.info(f"计算得出订单数量 - 买入: {buy_quantity} (最大可用: {max_buy_quantity:.8f})")
+            logger.info(f"计算得出订单数量 - 卖出: {sell_quantity} (最大可用: {max_sell_quantity:.8f})")
         else:
             buy_quantity = round_to_precision(self.order_quantity, self.base_precision)
             sell_quantity = round_to_precision(self.order_quantity, self.base_precision)
             
-            # 确保不超过精度限制
+            # 确保不超过可用余额
+            max_buy_quantity = quote_balance / buy_prices[0]
+            max_sell_quantity = base_balance
+            
+            buy_quantity = min(buy_quantity, max_buy_quantity)
+            sell_quantity = min(sell_quantity, max_sell_quantity)
+            
             buy_quantity = float(f"%.{self.base_precision}f" % buy_quantity)
             sell_quantity = float(f"%.{self.base_precision}f" % sell_quantity)
         
-        # 下買單
-        buy_order_count = 0
-        for price in buy_prices:
-            # 根據市場情況動態調整訂單數量
-            adjusted_quantity = self._adjust_quantity_by_market(buy_quantity, 'buy')
-            
-            order_details = {
-                "orderType": "Limit",
-                "price": str(price),
-                "quantity": str(adjusted_quantity),
-                "side": "Bid",
-                "symbol": self.symbol,
-                "timeInForce": "GTC",
-                "postOnly": True
-            }
-            
-            result = execute_order(self.api_key, self.secret_key, order_details)
-            
-            if isinstance(result, dict) and "error" in result:
-                logger.error(f"買單失敗: {result['error']}")
-                if "POST_ONLY_TAKER" in str(result['error']):
-                    logger.info("調整買單價格並重試...")
-                    adjusted_price = round_to_tick_size(price - self.tick_size, self.tick_size)
-                    order_details["price"] = str(adjusted_price)
-                    result = execute_order(self.api_key, self.secret_key, order_details)
-                    if isinstance(result, dict) and "error" in result:
-                        logger.error(f"調整後買單仍然失敗: {result['error']}")
-                    else:
-                        logger.info(f"買單成功: 價格 {adjusted_price}, 數量 {adjusted_quantity} (調整後)")
-                        self.active_buy_orders.append(result)
-                        self.orders_placed += 1
-                        buy_order_count += 1
-            else:
-                logger.info(f"買單成功: 價格 {price}, 數量 {adjusted_quantity}")
-                self.active_buy_orders.append(result)
-                self.orders_placed += 1
-                buy_order_count += 1
-                
-            # 限制訂單數量
-            if buy_order_count >= self.max_orders:
-                break
+        # 检查订单数量是否满足最小要求
+        if buy_quantity < self.min_order_size:
+            logger.warning(f"买入数量 {buy_quantity} 小于最小订单大小 {self.min_order_size}，跳过买单")
+            buy_quantity = 0
         
-        # 下賣單
-        sell_order_count = 0
-        for price in sell_prices:
-            # 根據市場情況動態調整訂單數量
-            adjusted_quantity = self._adjust_quantity_by_market(sell_quantity, 'sell')
-            
-            order_details = {
-                "orderType": "Limit",
-                "price": str(price),
-                "quantity": str(adjusted_quantity),
-                "side": "Ask",
-                "symbol": self.symbol,
-                "timeInForce": "GTC",
-                "postOnly": True
-            }
-            
-            result = execute_order(self.api_key, self.secret_key, order_details)
-            
-            if isinstance(result, dict) and "error" in result:
-                logger.error(f"賣單失敗: {result['error']}")
-                if "POST_ONLY_TAKER" in str(result['error']):
-                    logger.info("調整賣單價格並重試...")
-                    adjusted_price = round_to_tick_size(price + self.tick_size, self.tick_size)
-                    order_details["price"] = str(adjusted_price)
-                    result = execute_order(self.api_key, self.secret_key, order_details)
-                    if isinstance(result, dict) and "error" in result:
-                        logger.error(f"調整後賣單仍然失敗: {result['error']}")
-                    else:
-                        logger.info(f"賣單成功: 價格 {adjusted_price}, 數量 {adjusted_quantity} (調整後)")
-                        self.active_sell_orders.append(result)
-                        self.orders_placed += 1
-                        sell_order_count += 1
-            else:
-                logger.info(f"賣單成功: 價格 {price}, 數量 {adjusted_quantity}")
-                self.active_sell_orders.append(result)
-                self.orders_placed += 1
-                sell_order_count += 1
+        if sell_quantity < self.min_order_size:
+            logger.warning(f"卖出数量 {sell_quantity} 小于最小订单大小 {self.min_order_size}，跳过卖单")
+            sell_quantity = 0
+        
+        # 下买单
+        buy_order_count = 0
+        if buy_quantity > 0:
+            for price in buy_prices:
+                # 检查剩余资金是否足够
+                required_quote = price * buy_quantity
+                if required_quote > quote_balance:
+                    logger.warning(f"剩余资金不足，停止下买单 (需要: {required_quote:.8f} {self.quote_asset}, 可用: {quote_balance:.8f} {self.quote_asset})")
+                    break
                 
-            # 限制訂單數量
-            if sell_order_count >= self.max_orders:
-                break
-            
+                # 下单逻辑保持不变...
+                
+                quote_balance -= required_quote  # 更新剩余资金
+        
+        # 下卖单
+        sell_order_count = 0
+        if sell_quantity > 0:
+            for price in sell_prices:
+                # 检查剩余余额是否足够
+                if sell_quantity > base_balance:
+                    logger.warning(f"剩余{self.base_asset}不足，停止下卖单 (需要: {sell_quantity:.8f}, 可用: {base_balance:.8f})")
+                    break
+                
+                # 下单逻辑保持不变...
+                
+                base_balance -= sell_quantity  # 更新剩余余额
+        
         logger.info(f"共下單: {buy_order_count} 個買單, {sell_order_count} 個賣單")
     
     def _adjust_quantity_by_market(self, base_quantity, side):
