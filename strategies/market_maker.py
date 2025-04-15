@@ -731,100 +731,109 @@ class MarketMaker:
         return bid_price, ask_price
     
     def calculate_dynamic_spread(self):
-        """計算動態價差基於市場情況"""
-        # 手续费率
+        """计算更合理的动态价差"""
+        # 基础手续费
         MAKER_FEE = 0.0008  # 0.08%
-        TAKER_FEE = 0.0010  # 0.10%
         
-        # 计算最小价差以覆盖手续费
-        min_spread_for_fees = (MAKER_FEE + MAKER_FEE) * 100  # 转换为百分比
-        # 使用配置的最小利润倍数
-        min_profitable_spread = min_spread_for_fees * self.min_profit_multiplier
+        # 获取当前市场价差
+        market_spread = self._get_market_spread()
         
-        # 基础价差不应小于最小盈利价差
-        base_spread = max(self.base_spread_percentage, min_profitable_spread)
+        # 计算最小价差
+        min_spread_for_fees = (MAKER_FEE * 2) * 100  # 基础手续费价差
         
-        # 获取当前市场波动率
-        volatility = 0
-        if self.ws and hasattr(self.ws, 'historical_prices'):
-            volatility = calculate_volatility(self.ws.historical_prices)
+        # 降低利润倍数，从1.5降到1.2
+        base_profit_multiplier = 1.2
         
-        # 根据波动率调整价差
+        # 计算基础价差，考虑市场实际情况
+        min_profitable_spread = min_spread_for_fees * base_profit_multiplier
+        
+        # 使用市场价差作为参考
+        market_based_spread = market_spread * 1.1  # 略高于市场价差
+        
+        # 选择合适的基础价差
+        base_spread = min(
+            max(min_profitable_spread, market_based_spread),
+            0.15  # 设置最大价差上限为0.15%
+        )
+        
+        # 获取市场深度信息
+        depth_score = self._calculate_depth_score()
+        
+        # 根据市场深度调整价差
+        if depth_score > 0.7:  # 深度好
+            base_spread *= 0.9
+        
+        # 更温和的波动率调整
+        volatility = self._calculate_volatility()
         if volatility > 0:
-            if volatility > self.volatility_threshold:  # 高波动
-                # 高波动时显著增加价差
-                adjusted_spread = base_spread * (1 + volatility * 2)
-            else:  # 低波动
-                # 低波动时适当减小价差，但不低于最小盈利价差
-                adjusted_spread = max(
-                    min_profitable_spread,
-                    base_spread * (1 - volatility * 0.5)
-                )
+            if volatility > self.volatility_threshold:
+                adjusted_spread = base_spread * (1 + volatility)  # 降低波动率影响
+            else:
+                adjusted_spread = base_spread * (1 - volatility * 0.3)  # 低波动时可以降低价差
         else:
             adjusted_spread = base_spread
+        
+        # 确保最终价差在合理范围内
+        final_spread = max(
+            min(adjusted_spread, 0.15),  # 最大不超过0.15%
+            min_profitable_spread * 0.9   # 最小不低于基础盈利价差的90%
+        )
+        
+        logger.info(f"市场价差: {market_spread:.4f}%")
+        logger.info(f"基础盈利价差: {min_profitable_spread:.4f}%")
+        logger.info(f"调整后价差: {final_spread:.4f}%")
+        
+        return final_spread
+
+    def _get_market_spread(self):
+        """获取当前市场价差"""
+        if not self.ws.orderbook:
+            return 0.1  # 默认值
             
-        logger.info(f"最小盈利价差: {min_profitable_spread:.4f}%, 调整后价差: {adjusted_spread:.4f}%")
-        return adjusted_spread
+        bids = self.ws.orderbook['bids']
+        asks = self.ws.orderbook['asks']
+        
+        if not bids or not asks:
+            return 0.1
+            
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+        
+        spread_pct = ((best_ask - best_bid) / best_bid) * 100
+        return spread_pct
     
     def calculate_prices(self):
-        """計算買賣訂單價格"""
+        """计算买卖订单价格"""
         try:
             bid_price, ask_price = self.get_market_depth()
             if bid_price is None or ask_price is None:
-                current_price = self.get_current_price()
-                if current_price is None:
-                    logger.error("無法獲取價格信息，無法設置訂單")
-                    return None, None
-                mid_price = current_price
-            else:
-                mid_price = (bid_price + ask_price) / 2
+                return None, None
             
-            logger.info(f"市場中間價: {mid_price}")
+            mid_price = (bid_price + ask_price) / 2
             
-            # 使用考虑手续费的动态价差
+            # 使用新的价差计算方法
             spread_percentage = self.calculate_dynamic_spread()
             exact_spread = mid_price * (spread_percentage / 100)
             
-            # 计算买卖价格时额外考虑手续费影响
-            MAKER_FEE = 0.0008
-            fee_adjustment = mid_price * MAKER_FEE
+            # 更温和的价格调整
+            base_buy_price = mid_price - (exact_spread / 2)
+            base_sell_price = mid_price + (exact_spread / 2)
             
-            base_buy_price = mid_price - (exact_spread / 2) - fee_adjustment
-            base_sell_price = mid_price + (exact_spread / 2) + fee_adjustment
+            # 确保价格合理性
+            if base_buy_price < bid_price * 0.995:  # 不要离最佳价格太远
+                base_buy_price = bid_price * 0.995
+            if base_sell_price > ask_price * 1.005:
+                base_sell_price = ask_price * 1.005
             
-            base_buy_price = round_to_tick_size(base_buy_price, self.tick_size)
-            base_sell_price = round_to_tick_size(base_sell_price, self.tick_size)
+            # 记录价格信息
+            logger.info(f"市场中间价: {mid_price}")
+            logger.info(f"买入价: {base_buy_price} (距离最佳买价: {((bid_price - base_buy_price) / bid_price * 100):.4f}%)")
+            logger.info(f"卖出价: {base_sell_price} (距离最佳卖价: {((base_sell_price - ask_price) / ask_price * 100):.4f}%)")
             
-            actual_spread = base_sell_price - base_buy_price
-            actual_spread_pct = (actual_spread / mid_price) * 100
-            logger.info(f"使用的價差: {actual_spread_pct:.4f}% (目標: {spread_percentage}%), 絕對價差: {actual_spread}")
-            
-            # 計算梯度訂單價格
-            buy_prices = []
-            sell_prices = []
-            
-            # 優化梯度分佈：較小的梯度以提高成交率
-            for i in range(self.max_orders):
-                # 非線性遞增的梯度，靠近中間的訂單梯度小，越遠離中間梯度越大
-                gradient_factor = (i ** 1.5) * 1.5
-                
-                buy_adjustment = gradient_factor * self.tick_size
-                sell_adjustment = gradient_factor * self.tick_size
-                
-                buy_price = round_to_tick_size(base_buy_price - buy_adjustment, self.tick_size)
-                sell_price = round_to_tick_size(base_sell_price + sell_adjustment, self.tick_size)
-                
-                buy_prices.append(buy_price)
-                sell_prices.append(sell_price)
-            
-            final_spread = sell_prices[0] - buy_prices[0]
-            final_spread_pct = (final_spread / mid_price) * 100
-            logger.info(f"最終價差: {final_spread_pct:.4f}% (最低賣價 {sell_prices[0]} - 最高買價 {buy_prices[0]} = {final_spread})")
-            
-            return buy_prices, sell_prices
+            return base_buy_price, base_sell_price
         
         except Exception as e:
-            logger.error(f"計算價格時出錯: {str(e)}")
+            logger.error(f"计算价格时出错: {str(e)}")
             return None, None
     
     def need_rebalance(self):
