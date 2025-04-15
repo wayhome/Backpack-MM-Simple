@@ -1047,8 +1047,9 @@ class MarketMaker:
         self.check_ws_connection()
         self.cancel_existing_orders()
         
-        buy_prices, sell_prices = self.calculate_prices()
-        if buy_prices is None or sell_prices is None:
+        # 获取买卖价格
+        buy_price, sell_price = self.calculate_prices()
+        if buy_price is None or sell_price is None:
             logger.error("無法計算訂單價格，跳過下單")
             return
         
@@ -1070,8 +1071,8 @@ class MarketMaker:
         
         # 处理订单数量
         if self.order_quantity is None:
-            # 计算每个订单的数量
-            avg_price = sum(buy_prices) / len(buy_prices)
+            # 使用当前买入价格计算数量
+            avg_price = buy_price  # 修改这里，直接使用买入价格
             
             # 提高资金利用率，根据市场深度动态调整
             order_book = get_order_book(self.symbol)
@@ -1124,7 +1125,7 @@ class MarketMaker:
             sell_quantity = round_to_precision(self.order_quantity, self.base_precision)
             
             # 确保不超过可用余额
-            max_buy_quantity = quote_balance / buy_prices[0]
+            max_buy_quantity = quote_balance / buy_price
             max_sell_quantity = base_balance
             
             buy_quantity = min(buy_quantity, max_buy_quantity)
@@ -1143,33 +1144,55 @@ class MarketMaker:
             sell_quantity = 0
         
         # 下买单
-        buy_order_count = 0
         if buy_quantity > 0:
-            for price in buy_prices:
-                # 检查剩余资金是否足够
-                required_quote = price * buy_quantity
-                if required_quote > quote_balance:
-                    logger.warning(f"剩余资金不足，停止下买单 (需要: {required_quote:.8f} {self.quote_asset}, 可用: {quote_balance:.8f} {self.quote_asset})")
-                    break
+            # 检查剩余资金是否足够
+            required_quote = buy_price * buy_quantity
+            if required_quote > quote_balance:
+                logger.warning(f"剩余资金不足，无法下买单 (需要: {required_quote:.8f} {self.quote_asset}, 可用: {quote_balance:.8f} {self.quote_asset})")
+            else:
+                # 构建买单
+                buy_order = {
+                    "orderType": "Limit",
+                    "price": str(buy_price),
+                    "quantity": str(buy_quantity),
+                    "side": "Bid",
+                    "symbol": self.symbol,
+                    "timeInForce": "GTC",
+                    "postOnly": True
+                }
                 
-                # 下单逻辑保持不变...
-                
-                quote_balance -= required_quote  # 更新剩余资金
+                # 执行买单
+                buy_result = execute_order(self.api_key, self.secret_key, buy_order)
+                if isinstance(buy_result, dict) and "error" in buy_result:
+                    logger.error(f"买单执行失败: {buy_result['error']}")
+                else:
+                    logger.info(f"买单已提交: {buy_quantity} @ {buy_price}")
+                    quote_balance -= required_quote
         
         # 下卖单
-        sell_order_count = 0
         if sell_quantity > 0:
-            for price in sell_prices:
-                # 检查剩余余额是否足够
-                if sell_quantity > base_balance:
-                    logger.warning(f"剩余{self.base_asset}不足，停止下卖单 (需要: {sell_quantity:.8f}, 可用: {base_balance:.8f})")
-                    break
+            # 检查剩余余额是否足够
+            if sell_quantity > base_balance:
+                logger.warning(f"剩余{self.base_asset}不足，无法下卖单 (需要: {sell_quantity:.8f}, 可用: {base_balance:.8f})")
+            else:
+                # 构建卖单
+                sell_order = {
+                    "orderType": "Limit",
+                    "price": str(sell_price),
+                    "quantity": str(sell_quantity),
+                    "side": "Ask",
+                    "symbol": self.symbol,
+                    "timeInForce": "GTC",
+                    "postOnly": True
+                }
                 
-                # 下单逻辑保持不变...
-                
-                base_balance -= sell_quantity  # 更新剩余余额
-        
-        logger.info(f"共下單: {buy_order_count} 個買單, {sell_order_count} 個賣單")
+                # 执行卖单
+                sell_result = execute_order(self.api_key, self.secret_key, sell_order)
+                if isinstance(sell_result, dict) and "error" in sell_result:
+                    logger.error(f"卖单执行失败: {sell_result['error']}")
+                else:
+                    logger.info(f"卖单已提交: {sell_quantity} @ {sell_price}")
+                    base_balance -= sell_quantity
     
     def _adjust_quantity_by_market(self, base_quantity, side):
         """根据市场情况动态调整订单数量"""
@@ -1604,18 +1627,24 @@ class MarketMaker:
     def _calculate_volatility(self):
         """计算市场波动率"""
         try:
-            # 获取最近的K线数据
-            klines = self.get_recent_klines(interval='1m', limit=30)
+            # 使用client.py中的get_klines方法
+            klines = get_klines(self.symbol, interval='1m', limit=30)
+            if isinstance(klines, dict) and "error" in klines:
+                logger.error(f"获取K线数据失败: {klines['error']}")
+                return 0.0
+                
             if not klines:
                 return 0.0
                 
             # 计算收盘价的标准差
-            closes = [float(k[4]) for k in klines]
+            closes = [float(k[4]) for k in klines]  # k[4]是收盘价
             std_dev = np.std(closes)
             mean_price = np.mean(closes)
             
             # 返回波动率（标准差/均价）
-            return std_dev / mean_price if mean_price > 0 else 0.0
+            volatility = std_dev / mean_price if mean_price > 0 else 0.0
+            logger.info(f"当前波动率: {volatility:.4f}")
+            return volatility
             
         except Exception as e:
             logger.error(f"计算波动率出错: {str(e)}")
@@ -1624,19 +1653,26 @@ class MarketMaker:
     def _calculate_trend(self):
         """计算市场趋势"""
         try:
-            # 获取最近的K线数据
-            klines = self.get_recent_klines(interval='5m', limit=12)
+            # 使用client.py中的get_klines方法
+            klines = get_klines(self.symbol, interval='5m', limit=12)
+            if isinstance(klines, dict) and "error" in klines:
+                logger.error(f"获取K线数据失败: {klines['error']}")
+                return 0.0
+                
             if not klines:
                 return 0.0
                 
             # 计算简单移动平均线
-            closes = [float(k[4]) for k in klines]
+            closes = [float(k[4]) for k in klines]  # k[4]是收盘价
             sma_5 = np.mean(closes[-5:])
             sma_12 = np.mean(closes)
             
             # 计算趋势强度 (-1到1之间)
             trend = (sma_5 - sma_12) / sma_12 if sma_12 > 0 else 0.0
-            return max(min(trend, 1.0), -1.0)
+            trend = max(min(trend, 1.0), -1.0)
+            
+            logger.info(f"当前趋势: {trend:.4f}")
+            return trend
             
         except Exception as e:
             logger.error(f"计算趋势出错: {str(e)}")
@@ -1675,8 +1711,9 @@ class MarketMaker:
         """计算成交量水平"""
         try:
             # 获取最近的K线数据
-            klines = self.get_recent_klines(interval='1m', limit=30)
-            if not klines:
+            klines = get_klines(self.symbol, interval='1m', limit=30)
+            if isinstance(klines, dict) and "error" in klines:
+                logger.error(f"获取K线数据失败: {klines['error']}")
                 return 0.0
                 
             # 计算平均成交量
