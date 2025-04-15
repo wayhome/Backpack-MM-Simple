@@ -1042,10 +1042,17 @@ class MarketMaker:
             logger.info(f"已經訂閲了訂單更新: {stream}")
             return True
     
-    def place_limit_orders(self, buy_price, sell_price):
-        """
-        在指定价格放置买卖限价单
-        """
+    def place_limit_orders(self):
+        """下限价单"""
+        self.check_ws_connection()
+        self.cancel_existing_orders()
+        
+        # 获取买卖价格
+        buy_price, sell_price = self.calculate_prices()
+        if buy_price is None or sell_price is None:
+            logger.error("無法計算訂單價格，跳過下單")
+            return
+            
         try:
             # 获取当前余额
             balances = get_balance(self.api_key, self.secret_key)
@@ -1814,7 +1821,7 @@ class MarketMaker:
                 if self.need_rebalance():
                     self.rebalance_position()
                 
-                # 下限价单
+                # 计算买卖价格
                 self.place_limit_orders()
                 
                 # 估算利润
