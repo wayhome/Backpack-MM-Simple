@@ -3,3 +3,4 @@
 .python-version
 __pycache__
 market_maker.log
+orders.db

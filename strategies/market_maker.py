@@ -1669,9 +1669,19 @@ class MarketMaker:
                 logger.warning("K线数据无效或为空")
                 return 0.0
                 
-            # 计算收盘价的标准差
             try:
-                closes = [float(k[4]) for k in klines]  # k[4]是收盘价
+                # 检查K线数据格式
+                if isinstance(klines[0], dict):
+                    # 如果是字典格式，获取收盘价
+                    if 'close' in klines[0]:
+                        closes = [float(k['close']) for k in klines]
+                    else:
+                        logger.error("K线数据中缺少close字段")
+                        return 0.0
+                else:
+                    logger.error("K线数据格式不正确")
+                    return 0.0
+                
                 if not closes:
                     logger.warning("无有效收盘价数据")
                     return 0.0
@@ -1688,7 +1698,7 @@ class MarketMaker:
                 return 0.0
                 
         except Exception as e:
-            logger.error(f"计算波动率出错: {str(e)}")
+            logger.exception(f"计算波动率出错: {str(e)}")
             return 0.0
             
     def _calculate_trend(self):
@@ -1705,8 +1715,18 @@ class MarketMaker:
                 return 0.0
                 
             try:
-                # 计算简单移动平均线
-                closes = [float(k[4]) for k in klines]  # k[4]是收盘价
+                # 检查K线数据格式
+                if isinstance(klines[0], dict):
+                    # 如果是字典格式，获取收盘价
+                    if 'close' in klines[0]:
+                        closes = [float(k['close']) for k in klines]
+                    else:
+                        logger.error("K线数据中缺少close字段")
+                        return 0.0
+                else:
+                    logger.error("K线数据格式不正确")
+                    return 0.0
+                
                 if len(closes) < 12:
                     logger.warning("K线数据不足")
                     return 0.0
@@ -1771,8 +1791,18 @@ class MarketMaker:
                 return 0.0
                 
             try:
-                # 计算平均成交量
-                volumes = [float(k[5]) for k in klines]  # k[5]是成交量
+                # 检查K线数据格式
+                if isinstance(klines[0], dict):
+                    # 如果是字典格式，获取成交量
+                    if 'volume' in klines[0]:
+                        volumes = [float(k['volume']) for k in klines]
+                    else:
+                        logger.error("K线数据中缺少volume字段")
+                        return 0.0
+                else:
+                    logger.error("K线数据格式不正确")
+                    return 0.0
+                
                 if not volumes:
                     logger.warning("无有效成交量数据")
                     return 0.0
